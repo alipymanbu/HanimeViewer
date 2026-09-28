@@ -17,6 +17,7 @@ Hanime1 是服务端渲染的站点：登录状态保存在浏览器 cookie 里�
 """
 
 import json
+import re
 import threading
 import time
 
@@ -562,10 +563,773 @@ def _click_button(chrome, button_id):
     return chrome.evaluate(expression).get("value")
 
 
-def video_action(video_id, action, timeout=25.0):
-    """对影片执行点赞 / 取消点赞 / 储存。
+# 读取点赞区的当前状态（比例 + 数量），用来判断点赞到底有没有生效
+_LIKE_STATE = (
+    "(()=>{"
+    "const btn=document.getElementById('video-like-btn');"
+    "if(!btn) return '';"
+    "const span=btn.querySelector('span');"
+    "const count=span?span.textContent.replace(/[()\\s]/g,''):'';"
+    "const m=(btn.innerText||'').match(/(\\d+(?:\\.\\d+)?%)/);"
+    "return JSON.stringify({ratio:m?m[1]:'',count:count});"
+    "})()"
+)
 
-    action: "like" | "unlike" | "save"
+
+def toggle_playlist_bookmark(list_id):
+    """收藏 / 取消收藏一个播放清单（官网右上角那个书签）。
+
+    官网机制（从播放清单页 HTML 里读出来的）：
+
+        <form id="playlist-show-add-form" method="POST"
+              action="https://hanime1.me/addPlaylist">
+          <input type="hidden" name="_token" value="...">
+          <input type="hidden" name="playlist-reference-id" value="976998">
+          <button type="submit">
+            <span id="playlist-bookmark-icon" class="material-symbols-outlined"
+                  style="font-variation-settings: 'FILL' 1;">bookmark</span>
+          </button>
+        </form>
+
+    要点：
+      - POST /addPlaylist 一次就**切换**状态（已收藏 -> 取消，未收藏 -> 收藏）。
+      - 收藏状态看 #playlist-bookmark-icon 的 style：
+        带 'FILL' 1 = 实心 = 已收藏。
+      - 所以流程是：先读当前状态 -> 提交表单 -> 再读一次确认真的变了。
+
+    返回 (成功, 消息, {"bookmarked": bool})。
+    """
+    account = get_account()
+
+    if not account["logged_in"]:
+        return False, "需要先登录才能收藏播放清单", {}
+
+    chrome = ChromeCDP()
+
+    url = f"https://hanime1.me/playlist?list={list_id}"
+
+    ready, _ = chrome.navigate_and_wait(
+        url,
+        timeout=25.0,
+        min_stable=0.6,
+    )
+
+    if not ready:
+        return False, "打不开播放清单页面", {}
+
+    def read_state():
+        raw = chrome.evaluate(
+            "(()=>{const e=document.getElementById('playlist-bookmark-icon');"
+            "if(!e) return 'missing';"
+            "return String(e.getAttribute('style')||'');})()"
+        ).get("value") or ""
+
+        if raw == "missing":
+            return None
+
+        normalized = raw.replace('"', "'").replace(" ", "")
+
+        return "'FILL'1" in normalized
+
+    before = read_state()
+
+    if before is None:
+        return False, "这个页面没有收藏书签（可能是自己的播放清单）", {}
+
+    # 提交表单（POST /addPlaylist 会切换状态）
+    try:
+        result = chrome.evaluate(
+            """(()=>{
+                const form = document.getElementById('playlist-show-add-form');
+                if (!form) return 'no-form';
+
+                const token = form.querySelector("input[name='_token']");
+                const ref = form.querySelector(
+                    "input[name='playlist-reference-id']");
+
+                if (!token || !ref) return 'no-fields';
+
+                const body = new URLSearchParams();
+                body.append('_token', token.value);
+                body.append('playlist-reference-id', ref.value);
+
+                fetch(form.getAttribute('action'), {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: body.toString(),
+                    credentials: 'same-origin',
+                    redirect: 'follow',
+                }).catch(() => {});
+
+                return 'posted';
+            })()"""
+        ).get("value")
+    except Exception as exc:
+        return False, f"提交收藏失败：{exc}", {}
+
+    if result == "no-form":
+        return False, "找不到收藏表单", {}
+
+    if result == "no-fields":
+        return False, "收藏表单缺少必要字段", {}
+
+    time.sleep(2.0)
+
+    # 重新加载确认状态真的翻转了（不能只信接口 200）
+    after = None
+
+    try:
+        chrome.navigate_and_wait(
+            url,
+            timeout=25.0,
+            min_stable=0.6,
+        )
+
+        after = read_state()
+    except Exception:
+        pass
+
+    if after is None:
+        return False, "提交后读不到书签状态", {}
+
+    if after == before:
+        return (
+            False,
+            "提交了收藏请求，但状态没有变化，可能没有真正生效。",
+            {"bookmarked": before},
+        )
+
+    if after:
+        return True, "已收藏到我的播放清单", {"bookmarked": True}
+
+    return True, "已取消收藏", {"bookmarked": False}
+
+
+def fetch_playlists(video_id):
+    """读取「储存」弹窗里可选的播放清单。
+
+    弹窗结构（实测）：
+
+        <form id="video-save-form" action="https://hanime1.me/save" method="POST">
+          <input type="hidden" name="_token" value="...">
+          <input type="hidden" name="playlist-video-id" value="408116">
+          <label class="playlist-checkbox-container">
+            稍后观看 <input type="checkbox" ...>
+          </label>
+          ...
+          <button>完成储存影片</button>
+        </form>
+
+    返回 [(清单名, 是否已勾选), ...]，失败返回 []。
+    """
+    account = get_account()
+
+    if not account["logged_in"]:
+        return []
+
+    chrome = ChromeCDP()
+
+    ready, _ = chrome.navigate_and_wait(
+        VIDEO_URL.format(video_id=video_id),
+        all_selectors=[
+            "#video-artist-name",
+            "video",
+            ".video-description-panel",
+        ],
+        timeout=25.0,
+        min_stable=0.6,
+    )
+
+    if not ready:
+        return []
+
+    # 打开弹窗（只是让它渲染出选项，不提交）
+    try:
+        chrome.evaluate(
+            "(()=>{const e=document.getElementById('video-save-btn');"
+            "if(e) e.click(); return 1;})()"
+        )
+        time.sleep(1.5)
+    except Exception:
+        pass
+
+    try:
+        raw = chrome.evaluate(
+            "(()=>{"
+            "const m=document.getElementById('playlistModal');"
+            "if(!m) return '[]';"
+            "const out=[];"
+            "m.querySelectorAll('label.playlist-checkbox-container').forEach(l=>{"
+            "const cb=l.querySelector('input[type=checkbox]');"
+            "const name=(l.innerText||'').trim();"
+            "if(name) out.push({name:name,checked:!!(cb&&cb.checked)});"
+            "});"
+            "return JSON.stringify(out);"
+            "})()"
+        ).get("value") or "[]"
+
+        items = json.loads(raw)
+    except Exception:
+        items = []
+
+    # 关掉弹窗，避免影响后续操作
+    try:
+        chrome.evaluate(
+            "(()=>{const b=document.querySelector('#playlistModal .close');"
+            "if(b) b.click(); return 1;})()"
+        )
+    except Exception:
+        pass
+
+    return items
+
+
+def save_to_playlist(video_id, playlist_name="", save=True):
+    """把影片储存到播放清单，或从播放清单里移除。
+
+    `save=True`  -> 加入清单（checkbox 设为勾选）
+    `save=False` -> 从清单移除（checkbox 设为未勾选）
+
+    两种操作走**同一套流程**，区别只是目标勾选状态：
+
+    官网的真实逻辑（从站点 app.js 里读出来的，别再猜了）：
+
+        $(document).on("change", "#playlistModal input.playlist-checkbox",
+        function(){
+          $.ajax({ type:"POST", url: $("#video-save-form").attr("action"),
+            data: jQuery.param({
+              input_id:   $(this).attr("id"),        // 清单 id
+              user_id:    $("#playlist-user-id").val(),
+              video_id:   $("#playlist-video-id").val(),
+              is_checked: $(this).prop("checked"),   // true=加入 false=移除
+            }), dataType:"json" })
+        })
+
+    三个关键点（都踩过）：
+      1. 触发条件是 checkbox 的 **change 事件**，不是点「完成储存影片」按钮
+         （那个按钮只带 data-dismiss="modal"，什么都不提交）。
+         用 JS 直接设 .checked 是**不会**触发 change 的，
+         必须自己 dispatchEvent 一个 change。
+      2. 字段名是 input_id / user_id / video_id / is_checked，
+         不是把清单 id 当字段名。
+      3. 服务端按 is_checked 决定「加入」还是「移除」——
+         所以取消储存就是把 checkbox 设成未勾选再派发 change。
+
+    playlist_name 为空时用第一个清单。
+    """
+    account = get_account()
+
+    if not account["logged_in"]:
+        return False, "需要先登录才能储存", {}
+
+    chrome = ChromeCDP()
+
+    ready, _ = chrome.navigate_and_wait(
+        VIDEO_URL.format(video_id=video_id),
+        all_selectors=[
+            "#video-artist-name",
+            "video",
+            ".video-description-panel",
+        ],
+        timeout=25.0,
+        min_stable=0.6,
+    )
+
+    if not ready:
+        return False, "打不开影片页面", {}
+
+    # 打开储存弹窗
+    try:
+        clicked = chrome.evaluate(
+            "(()=>{const e=document.getElementById('video-save-btn');"
+            "if(!e) return 'missing';"
+            "const t=e.getAttribute('data-target')||'';"
+            "if(t.indexOf('signUpModal')!==-1) return 'needs-login';"
+            "e.click(); return 'clicked';})()"
+        ).get("value")
+    except Exception as exc:
+        return False, f"打开储存弹窗失败：{exc}", {}
+
+    if clicked == "needs-login":
+        with _state_lock:
+            _state["checked_at"] = 0.0
+
+        return False, "登录状态已失效，请重新登录", {}
+
+    if clicked != "clicked":
+        return False, "找不到储存按钮", {}
+
+    time.sleep(1.8)
+
+    # 把目标清单的勾选状态设成想要的值，再派发 change 让站点自己去提交
+    expression = """
+    (() => {
+        const form = document.getElementById('video-save-form');
+        if (!form) return 'no-form';
+
+        const boxes = [...form.querySelectorAll('input.playlist-checkbox')];
+        if (!boxes.length) return 'no-playlist';
+
+        const want = %s;
+        const wantChecked = %s;
+
+        let target = null;
+
+        if (want) {
+            target = boxes.find(b => {
+                const label = b.closest('label');
+                return label && (label.innerText || '').trim() === want;
+            }) || null;
+            if (!target) return 'playlist-not-found';
+        } else {
+            target = boxes[0];
+        }
+
+        const label = target.closest('label');
+        const name = label ? (label.innerText || '').trim() : target.id;
+
+        // 已经是想要的状态就不用再动
+        if (target.checked === wantChecked) {
+            return 'nochange:' + name + ':' + target.id;
+        }
+
+        target.checked = wantChecked;
+        target.dispatchEvent(new Event('change', {bubbles: true}));
+
+        return 'submitted:' + name + ':' + target.id;
+    })()
+    """ % (
+        json.dumps(playlist_name or ""),
+        "true" if save else "false",
+    )
+
+    try:
+        result = chrome.evaluate(expression).get("value") or ""
+    except Exception as exc:
+        return False, f"提交储存失败：{exc}", {}
+
+    action_word = "储存" if save else "取消储存"
+
+    if result.startswith("nochange:"):
+        _tag, name, list_id = (result.split(":") + ["", ""])[:3]
+
+        return (
+            True,
+            f"「{name}」本来就没有这部影片"
+            if not save
+            else f"这个影片已经在「{name}」里了",
+            {
+                "playlist": name,
+                "list_id": list_id,
+                "saved": save,
+                "verified": True,
+            },
+        )
+
+    if result.startswith("submitted:"):
+        _tag, name, list_id = (result.split(":") + ["", ""])[:3]
+
+        # 官网的 XHR 完成后会返回新的按钮 HTML，等它落地
+        time.sleep(2.5)
+
+        in_playlist = None
+
+        # 复核：**重新加载影片页**，看目标清单的 checkbox 现在是什么状态。
+        #
+        # 为什么不能用 `/api/playlist?list_id=xxx` 复核：
+        # 「稍后观看」的清单 id 是 `save`，而 `/playlist?list=save`
+        # 是个 **404 页面**（实测），拿它去查永远是 0 部影片 ——
+        # 于是保存到「稍后观看」会被判成失败。
+        # 后果很隐蔽：接口报错 -> 详情缓存不被清 -> 再进详情页
+        # 拿到的还是旧的 saved=false，图标显示成空心（用户报的就是这个）。
+        #
+        # 储存表单里的 checkbox 状态才是权威答案，而且它按**名字**匹配，
+        # 「稍后观看」这种特殊清单一样适用。
+        try:
+            chrome.navigate_and_wait(
+                VIDEO_URL.format(video_id=video_id),
+                all_selectors=[
+                    "#video-artist-name",
+                    "video",
+                    ".video-description-panel",
+                ],
+                timeout=25.0,
+                min_stable=0.6,
+            )
+
+            probe = """
+            (() => {
+                const form = document.getElementById('video-save-form');
+                if (!form) return 'no-form';
+
+                const want = %s;
+                const boxes = [...form.querySelectorAll(
+                    'input.playlist-checkbox')];
+
+                const target = want
+                    ? boxes.find(b => {
+                        const l = b.closest('label');
+                        return l && (l.innerText || '').trim() === want;
+                      })
+                    : boxes[0];
+
+                if (!target) return 'not-found';
+
+                return target.checked ? 'checked' : 'unchecked';
+            })()
+            """ % json.dumps(name)
+
+            probe_result = (
+                chrome.evaluate(probe).get("value") or ""
+            )
+
+            if probe_result == "checked":
+                in_playlist = True
+
+            elif probe_result == "unchecked":
+                in_playlist = False
+        except Exception:
+            in_playlist = None
+
+        if in_playlist is None:
+            return (
+                False,
+                f"提交了{action_word}请求，但没能复核结果，请稍后刷新看看。",
+                {"playlist": name, "list_id": list_id, "verified": False},
+            )
+
+        if in_playlist == save:
+            message = (
+                f"已储存到「{name}」"
+                if save
+                else f"已从「{name}」取消储存"
+            )
+
+            return (
+                True,
+                message,
+                {
+                    "playlist": name,
+                    "list_id": list_id,
+                    "saved": save,
+                    "verified": True,
+                },
+            )
+
+        return (
+            False,
+            (
+                f"提交了{action_word}请求，但复核发现「{name}」的状态没变"
+                f"（现在{'在' if in_playlist else '不在'}这个清单里）。"
+            ),
+            {
+                "playlist": name,
+                "list_id": list_id,
+                "saved": in_playlist,
+                "verified": False,
+            },
+        )
+
+    mapping = {
+        "no-form": "找不到储存表单",
+        "no-playlist": "账号里没有可用的播放清单，请先到官网建一个",
+        "playlist-not-found": f"找不到播放清单「{playlist_name}」",
+    }
+
+    return False, mapping.get(result, f"{action_word}失败（{result}）"), {}
+
+
+def create_playlist(video_id, title, description=""):
+    """新建一个播放清单（对应储存弹窗顶部的「新增播放清单」）。
+
+    官网表单（实测）：
+
+        <form id="video-create-playlist-form"
+              action="https://hanime1.me/createPlaylist">
+          <input type="hidden" name="_token" ...>
+          <input type="hidden" name="create-playlist-video-id" value="408116">
+          <input name="playlist-title" required>          <- 标题（必填）
+          <textarea name="playlist-description"></textarea> <- 详细说明（选填）
+        </form>
+
+    成功后接口返回 JSON，里面的 `checkbox` 字段是**新清单的复选框 HTML**，
+    从中能取到新清单的 id。
+
+    返回 (成功, 消息, {"name":..., "list_id":...})。
+    """
+    account = get_account()
+
+    if not account["logged_in"]:
+        return False, "需要先登录才能新建播放清单", {}
+
+    title = (title or "").strip()
+
+    if not title:
+        return False, "标题不能为空", {}
+
+    chrome = ChromeCDP()
+
+    ready, _ = chrome.navigate_and_wait(
+        VIDEO_URL.format(video_id=video_id),
+        all_selectors=[
+            "#video-artist-name",
+            "video",
+            ".video-description-panel",
+        ],
+        timeout=25.0,
+        min_stable=0.6,
+    )
+
+    if not ready:
+        return False, "打不开影片页面", {}
+
+    expression = """
+    (async () => {
+        const form = document.getElementById('video-create-playlist-form');
+        if (!form) return 'no-form';
+
+        const titleInput = document.getElementById('playlist-title');
+        if (!titleInput) return 'no-title-input';
+
+        titleInput.value = %s;
+
+        const descInput = document.getElementById('playlist-description');
+        if (descInput) descInput.value = %s;
+
+        const body = new URLSearchParams();
+        form.querySelectorAll('input[name], textarea[name]').forEach(e => {
+            body.append(e.name, e.value);
+        });
+
+        const r = await fetch(form.getAttribute('action'), {
+            method: 'POST',
+            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+            body: body.toString(),
+            credentials: 'same-origin',
+            redirect: 'follow',
+        });
+
+        const text = await r.text();
+
+        return JSON.stringify({status: r.status, body: text.slice(0, 4000)});
+    })()
+    """ % (json.dumps(title), json.dumps(description or ""))
+
+    try:
+        raw = chrome.evaluate(
+            expression, timeout=90, await_promise=True
+        ).get("value")
+    except Exception as exc:
+        return False, f"新建播放清单失败：{exc}", {}
+
+    if raw == "no-form":
+        return False, "找不到新建清单的表单", {}
+
+    if raw == "no-title-input":
+        return False, "找不到标题输入框", {}
+
+    if not raw:
+        return False, "新建播放清单没有返回结果", {}
+
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return False, "新建播放清单返回了无法解析的内容", {}
+
+    if int(payload.get("status") or 0) != 200:
+        return False, f"新建播放清单失败（HTTP {payload.get('status')}）", {}
+
+    body = payload.get("body") or ""
+
+    # 从返回的 checkbox HTML 里抠出新清单的 id
+    list_id = ""
+    match = re.search(
+        r"playlist-checkbox[^>]*id=[\"'](\d+)[\"']", body
+    )
+
+    if not match:
+        match = re.search(r"id=[\"'](\d+)[\"'][^>]*playlist-checkbox", body)
+
+    if match:
+        list_id = match.group(1)
+
+    # 真正的确认：重新加载页面，看新清单有没有出现在储存表单里
+    verified = False
+
+    try:
+        time.sleep(1.5)
+
+        chrome.navigate_and_wait(
+            VIDEO_URL.format(video_id=video_id),
+            all_selectors=[
+                "#video-artist-name",
+                "video",
+                ".video-description-panel",
+            ],
+            timeout=25.0,
+            min_stable=0.6,
+        )
+
+        found = chrome.evaluate(
+            "(()=>{const f=document.getElementById('video-save-form');"
+            "if(!f) return 'no-form';"
+            "const names=[...f.querySelectorAll('label.playlist-checkbox-container')]"
+            ".map(l=>(l.innerText||'').trim());"
+            "return JSON.stringify(names);})()"
+        ).get("value") or "[]"
+
+        names = json.loads(found) if found.startswith("[") else []
+
+        verified = title in names
+    except Exception:
+        verified = False
+
+    if verified:
+        return (
+            True,
+            f"已新建播放清单「{title}」",
+            {"name": title, "list_id": list_id, "verified": True},
+        )
+
+    return (
+        False,
+        f"提交了新建请求，但「{title}」没有出现在清单里，可能没建成功。",
+        {"name": title, "list_id": list_id, "verified": False},
+    )
+
+
+def fetch_video_state(video_id):
+    """读取「当前账号对这个影片做过什么」——用来点亮图标。
+
+    返回：
+      {
+        "logged_in": bool,
+        "liked": bool,        # 已点赞
+        "disliked": bool,     # 已点踩（判不出来时为 False）
+        "saved": bool,        # 已储存到某个清单
+        "playlist": str,      # 存在哪个清单
+        "like_ratio": str,
+        "like_count": str,
+      }
+
+    判据（实测）：
+      1. 未登录时点赞按钮带 `data-target="#signUpModal"`；
+         登录后这个属性为空 —— 这是「能不能点」的可靠信号。
+      2. 已储存：打开储存弹窗，看哪个清单的 checkbox 是选中态。
+         （所以要打开弹窗，比只读 DOM 稍慢，但这是唯一可靠的判据。）
+    """
+    chrome = ChromeCDP()
+
+    ready, _ = chrome.navigate_and_wait(
+        VIDEO_URL.format(video_id=video_id),
+        all_selectors=[
+            "#video-artist-name",
+            "video",
+            ".video-description-panel",
+        ],
+        timeout=25.0,
+        min_stable=0.6,
+    )
+
+    state = {
+        "logged_in": False,
+        "liked": False,
+        "disliked": False,
+        "saved": False,
+        "playlist": "",
+        "like_ratio": "",
+        "like_count": "",
+    }
+
+    if not ready:
+        return state
+
+    try:
+        raw = chrome.evaluate(
+            "(()=>{"
+            "const like=document.getElementById('video-like-btn');"
+            "const unlike=document.getElementById('video-unlike-btn');"
+            "const save=document.getElementById('video-save-btn');"
+            "const t=e=>e?(e.getAttribute('data-target')||''):'#missing';"
+            "const span=like?like.querySelector('span'):null;"
+            "const count=span?span.textContent.replace(/[()\\s]/g,''):'';"
+            "const m=like?(like.innerText||'').match(/(\\d+(?:\\.\\d+)?%)/):null;"
+            "return JSON.stringify({"
+            "likeTarget:t(like),"
+            "unlikeTarget:t(unlike),"
+            "saveTarget:t(save),"
+            "ratio:m?m[1]:'',"
+            "count:count,"
+            "likeDisabled: like?!!like.disabled:false,"
+            "unlikeDisabled: unlike?!!unlike.disabled:false"
+            "});})()"
+        ).get("value") or "{}"
+
+        info = json.loads(raw)
+    except Exception:
+        return state
+
+    def needs_login(target):
+        return "signUpModal" in (target or "")
+
+    state["like_ratio"] = info.get("ratio", "")
+    state["like_count"] = info.get("count", "")
+
+    can_like = not needs_login(info.get("likeTarget"))
+    can_save = not needs_login(info.get("saveTarget"))
+
+    state["logged_in"] = can_like or can_save
+
+    if not state["logged_in"]:
+        return state
+
+    # 已点过赞的话，官网会把对应按钮置灰
+    state["liked"] = bool(info.get("likeDisabled"))
+    state["disliked"] = bool(info.get("unlikeDisabled"))
+
+    # 已储存：打开弹窗看选中态
+    if can_save:
+        try:
+            chrome.evaluate(
+                "(()=>{const e=document.getElementById('video-save-btn');"
+                "if(e) e.click(); return 1;})()"
+            )
+            time.sleep(1.5)
+
+            picked = chrome.evaluate(
+                "(()=>{"
+                "const m=document.getElementById('playlistModal');"
+                "if(!m) return '';"
+                "const b=[...m.querySelectorAll('input.playlist-checkbox')]"
+                ".find(x=>x.checked);"
+                "if(!b) return '';"
+                "const l=b.closest('label');"
+                "return (l?(l.innerText||'').trim():b.id);"
+                "})()"
+            ).get("value") or ""
+
+            if picked:
+                state["saved"] = True
+                state["playlist"] = picked
+
+            # 关掉弹窗
+            chrome.evaluate(
+                "(()=>{const b=document.querySelector("
+                "'#playlistModal .modal-close-btn');"
+                "if(b) b.click(); return 1;})()"
+            )
+        except Exception:
+            pass
+
+    return state
+
+
+def video_action(video_id, action, playlist="", timeout=25.0):
+    """对影片执行点赞 / 取消点赞 / 储存 / 取消储存。
+
+    action: "like" | "unlike" | "save" | "unsave"
 
     返回 (成功, 消息, 最新状态)
     """
@@ -574,10 +1338,16 @@ def video_action(video_id, action, timeout=25.0):
     if not account["logged_in"]:
         return False, "需要先登录才能使用这个功能", {}
 
+    # 储存 / 取消储存走单独的流程（要点弹窗 + 派发 change）
+    if action == "save":
+        return save_to_playlist(video_id, playlist, save=True)
+
+    if action == "unsave":
+        return save_to_playlist(video_id, playlist, save=False)
+
     button_map = {
         "like": LIKE_BUTTON_ID,
         "unlike": UNLIKE_BUTTON_ID,
-        "save": SAVE_BUTTON_ID,
     }
 
     button_id = button_map.get(action)
@@ -592,7 +1362,11 @@ def video_action(video_id, action, timeout=25.0):
     # 1. 打开影片页（登录状态下服务端会渲染出真实可用的按钮）
     ready, _ = chrome.navigate_and_wait(
         url,
-        ready_selector="#video-artist-name",
+        all_selectors=[
+            "#video-artist-name",
+            "video",
+            ".video-description-panel",
+        ],
         timeout=timeout,
         min_stable=0.6,
     )
@@ -620,40 +1394,92 @@ def video_action(video_id, action, timeout=25.0):
 
         return False, "登录状态已失效，请重新登录", {}
 
+    # 记录点击前的点赞数，用来验证是否真的生效
+    try:
+        before = json.loads(chrome.evaluate(_LIKE_STATE).get("value") or "{}")
+    except Exception:
+        before = {}
+
     # 3. 点击
     clicked = _click_button(chrome, button_id)
 
     if clicked != "clicked":
         return False, "点击失败", {}
 
-    # 4. 等站点自己的请求完成，然后重新加载确认结果
-    time.sleep(2.0)
+    # 4. 等站点自己的请求完成，然后在**同一个页面**上重新读状态。
+    #
+    #    注意不要立刻导航刷新来判断：官网点赞是页内 XHR，
+    #    原地读 DOM 就能看到数字变化，而且不会把页面上其它
+    #    未提交的状态（比如刚打开的弹窗）弄丢。
+    after = {}
+    changed = False
 
-    ready2, html = chrome.navigate_and_wait(
-        url,
-        ready_selector="#video-artist-name",
-        timeout=timeout,
-        min_stable=0.6,
-    )
+    for _ in range(12):
+        time.sleep(0.5)
 
-    state = {}
+        try:
+            after = json.loads(
+                chrome.evaluate(_LIKE_STATE).get("value") or "{}"
+            )
+        except Exception:
+            after = {}
 
-    if ready2 and html:
-        from parser.hanime_parser import HanimeParser
+        if after.get("count") and after.get("count") != before.get("count"):
+            changed = True
+            break
 
-        parser = HanimeParser(html)
-        info = parser.get_like_info()
+        if (
+            after.get("ratio")
+            and after.get("ratio") != before.get("ratio")
+        ):
+            changed = True
+            break
 
-        state = {
-            "like_ratio": info["like_ratio"],
-            "like_count": info["like_count"],
-            "unlike_count": info["unlike_count"],
-        }
+    if not changed:
+        # 数字没变：可能本来就是这样（比如重复点赞），
+        # 也可能是没生效。为了给出可靠结论，刷新一次再确认。
+        time.sleep(1.0)
+
+        try:
+            chrome.navigate_and_wait(
+                url,
+                all_selectors=[
+                    "#video-artist-name",
+                    "video",
+                    ".video-description-panel",
+                ],
+                timeout=timeout,
+                min_stable=0.6,
+            )
+
+            after = json.loads(
+                chrome.evaluate(_LIKE_STATE).get("value") or "{}"
+            )
+        except Exception:
+            pass
+
+        changed = after.get("count") != before.get("count") or (
+            after.get("ratio") != before.get("ratio")
+        )
+
+    state = {
+        "like_ratio": after.get("ratio", ""),
+        "like_count": after.get("count", ""),
+        "before_count": before.get("count", ""),
+        "changed": changed,
+    }
 
     messages = {
         "like": "点赞成功",
         "unlike": "已取消点赞",
-        "save": "已储存到播放清单",
     }
+
+    if not changed:
+        return (
+            False,
+            f"{messages.get(action, '操作')}，但点赞数没有变化，"
+            "可能站点没有接受这次操作。",
+            state,
+        )
 
     return True, messages.get(action, "完成"), state

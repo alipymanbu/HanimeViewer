@@ -43,12 +43,50 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
 
+  # 测 VolumeToastController 的"过一会儿自动隐藏"用（时间可以快进）
+  fake_async: ^1.3.3
+
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
   # activated in the `analysis_options.yaml` file located at the root of your
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+  msix: ^3.18.0
+
+# ---------------------------------------------------------------
+# MSIX 安装包配置
+# ---------------------------------------------------------------
+#
+# 打：
+#   dart run msix:create
+# 产物直接落到 HanimeData\Release（见 output_path），
+# 同时会生成一个自签名证书 msix\HanimeViewer.cer。
+#
+# 装：先双击 .cer 把它装到「本地计算机 → 受信任人」（需要管理员），
+#     再双击 .msix 安装。不装证书的话 Windows 会拒绝安装。
+#
+# 注意 windows_build_args：**必须**和 package_windows.ps1 里一致，
+# 带上 --no-tree-shake-icons，否则图标可能被摇没（那个坑踩过两次）。
+msix_config:
+  display_name: HanimeViewer
+  publisher_display_name: HanimeViewer
+  identity_name: HanimeViewer.HanimeViewer
+  # a.b.c.d 四段。跟着 pubspec 的 version 走时要手动同步。
+  msix_version: 1.0.0.0
+  logo_path: assets/msix_logo.png
+  # 应用要联网（自己的后端跑在 127.0.0.1:8000）
+  capabilities: internetClient
+  # 自己生成的证书（scripts\make_msix_cert.ps1 生成，subject = CN=HanimeViewer）。
+  # 不用 msix 默认那张 "Msix Testing"：那张没导出成文件，用户没法信任。
+  certificate_path: msix_cert/HanimeViewer.pfx
+  certificate_password: HanimeViewer
+  # 不在打包时装证书：那一步要管理员权限，会卡在 UAC 上。
+  # .cer 会跟安装包一起发给用户，装的时候手动信任一次。
+  install_certificate: false
+  output_path: E:\Hanime\HanimeViewer\HanimeData\Release
+  output_name: HanimeViewer
+  windows_build_args: --no-tree-shake-icons
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

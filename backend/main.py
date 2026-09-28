@@ -1,6 +1,8 @@
 import time
 import os
+import sys
 import threading
+import json
 
 from fastapi import FastAPI, HTTPException
 
@@ -27,6 +29,546 @@ app = FastAPI(
     title="HanimeViewer API",
     version="1.0.0"
 )
+
+
+# ==========================================================
+# 下载
+# ==========================================================
+#
+# 官网的 mp4 地址是带签名的（?secure=...），直接用外部下载器会 403，
+# 必须复用浏览器里那套 cookie 去取。所以这里由后端来下载。
+#
+# 为什么不用浏览器自己下载：CDP 的 Page.setDownloadBehavior 会把文件
+# 丢到 Chrome 的下载目录，用户很难找到，也没法做进度。
+# 自己用会话 cookie 拉流反而更可控。
+
+_downloads = {}
+_DOWNLOAD_LOCK = threading.Lock()
+
+
+# ---------- 应用数据目录与设置 ----------
+#
+# 数据默认放在**程序根目录**下的 HanimeData 里：
+#
+#   <程序根目录>\HanimeData\              应用数据
+#       settings.json                     设置
+#       downloads.json                    下载记录
+#       Downloads\                        默认下载目录（可在设置页改）
+#
+# 下载文件夹刻意**不直接放在程序根目录**，免得程序文件和下载文件混在一起。
+#
+# 但**装到系统里之后**（MSIX / Program Files）程序目录是只读的，
+# 数据得换到用户的 LocalAppData 去 —— 见 _installed_root()。
+# 想强制指定位置可以用环境变量 HANIME_DATA_DIR。
+
+APP_NAME = "HanimeViewer"
+
+
+def _packaged_exe():
+    """是不是 MSIX / Store 装出来的（可执行文件在 WindowsApps 下面）。"""
+    pathlib = __import__("pathlib")
+
+    try:
+        exe = str(pathlib.Path(sys.executable).resolve()).lower()
+    except Exception:
+        return False
+
+    return "\\windowsapps\\" in exe
+
+
+def _is_writable(path):
+    """真往里写一个文件试试 —— 光看权限位不准。"""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+
+        probe = path / ".write_probe"
+
+        probe.write_text("x", encoding="utf-8")
+        probe.unlink()
+
+        return True
+    except Exception:
+        return False
+
+
+def _installed_root():
+    """装到系统里时数据放哪：%LOCALAPPDATA%\\HanimeViewer。"""
+    pathlib = __import__("pathlib")
+
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+
+    return pathlib.Path(base) / APP_NAME
+
+
+def program_root():
+    """程序根目录 —— 数据就存它下面。
+
+    打包运行：可执行文件所在目录。
+    源码运行：backend/main.py 的上一级（也就是项目根）。
+
+    装到系统里（MSIX）则换成 %LOCALAPPDATA%\\HanimeViewer ——
+    那种情况下程序目录是只读的，数据放进去写不了。
+    """
+    pathlib = __import__("pathlib")
+
+    if getattr(sys, "frozen", False):
+        base = pathlib.Path(sys.executable).resolve().parent
+    else:
+        base = pathlib.Path(__file__).resolve().parent.parent
+
+    # 装到系统里（MSIX / Store）时程序目录是只读的，数据要放到用户的
+    # LocalAppData 去。
+    #
+    # 这一步必须放在"往上找项目根"**之前**：万一安装路径的某一级上面
+    # 碰巧有 .git 或者 backend + frontend，就会被认成项目根，
+    # 数据又写回只读的安装目录里去了。
+    #
+    # 而且**不能只靠写测试**来判断：MSIX 有文件系统虚拟化，主进程往
+    # 安装目录写会被重定向到包自己的私有目录，探针会"成功"；
+    # 但后端的 exe 是**子进程**、没有包标识，同样的路径它会真的失败。
+    # 所以 MSIX 直接看路径认，不猜。
+    if _packaged_exe():
+        return _installed_root()
+
+    # 打包出来的 exe 常常躺在 build 输出目录里
+    # （frontend\build\windows\x64\runner\Release\）。
+    # 那个目录会被重新编译清掉 —— 数据放进去迟早丢，
+    # 所以往上找到真正的项目根：认 .git，或者认 backend + frontend 同时在。
+    for candidate in [base, *base.parents]:
+        try:
+            if (candidate / ".git").exists():
+                return candidate
+
+            if (candidate / "backend").is_dir() and (
+                candidate / "frontend"
+            ).is_dir():
+                return candidate
+        except Exception:
+            continue
+
+    # 没找到项目根 —— 说明是打包运行。这时看程序目录能不能写
+    # （比如用户手动把便携版解压进了 Program Files）。
+    if not _is_writable(base):
+        return _installed_root()
+
+    return base
+
+
+def hanime_root():
+    """应用数据目录。
+
+    默认是 `<程序根目录>\\HanimeData`；
+    环境变量 `HANIME_DATA_DIR` 可以**整个换掉**它
+    （装出来的版本想跟便携版共用同一份数据时很有用）。
+    """
+    pathlib = __import__("pathlib")
+
+    override = os.environ.get("HANIME_DATA_DIR", "").strip()
+
+    if override:
+        return pathlib.Path(override)
+
+    return program_root() / "HanimeData"
+
+
+def default_download_dir():
+    """默认下载目录：<数据目录>\\Downloads"""
+    return hanime_root() / "Downloads"
+
+
+def _legacy_roots():
+    """以前用过、需要搬家过来的位置。"""
+    pathlib = __import__("pathlib")
+
+    return [
+        pathlib.Path(os.path.expanduser("~")) / "Downloads" / "Hanime",
+    ]
+
+
+def migrate_legacy_data():
+    """把老位置的数据搬到新位置。
+
+    只搬两个 JSON（设置和下载记录），**不动下载好的影片** ——
+    记录里存的是绝对路径，老文件在原地照样能打开、能播放，
+    没必要为此挪动几个 GB。
+    """
+    target = hanime_root()
+    legacy_paths = _legacy_roots()
+
+    for legacy in legacy_paths:
+        if not legacy.is_dir() or legacy == target:
+            continue
+
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+
+            moved = []
+
+            for name in ("settings.json", "downloads.json"):
+                source = legacy / name
+                destination = target / name
+
+                if source.is_file() and not destination.exists():
+                    import shutil as _shutil
+
+                    _shutil.copy2(source, destination)
+                    moved.append(name)
+
+            # 设置里的 download_dir 如果还指着老位置，就删掉它，
+            # 让新默认值生效（用户要的就是"默认下载位置改到程序根目录下"）。
+            # 只删"指向老默认位置"的那种；用户自己改过的路径保持不动。
+            settings_file = target / "settings.json"
+
+            if settings_file.is_file():
+                data = json.loads(settings_file.read_text(encoding="utf-8"))
+
+                configured = str(data.get("download_dir") or "")
+
+                if configured:
+                    import pathlib as _pathlib
+
+                    try:
+                        resolved = _pathlib.Path(configured).resolve()
+                    except Exception:
+                        resolved = None
+
+                    if resolved is not None and any(
+                        resolved == old.resolve()
+                        or old.resolve() in resolved.parents
+                        for old in legacy_paths
+                    ):
+                        data.pop("download_dir", None)
+
+                        settings_file.write_text(
+                            json.dumps(data, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+
+                        moved.append("(并把指向老位置的下载目录改回默认)")
+
+            if moved:
+                print(
+                    f"[migrate] 已把 {legacy} 里的 "
+                    f"{', '.join(moved)} 搬到 {target}"
+                )
+        except Exception as exc:
+            print(f"[warn] 迁移老数据失败（不影响使用）: {exc}")
+
+
+def _settings_path():
+    return hanime_root() / "settings.json"
+
+
+# 启动时就搬一次（必须在任何 load_settings() 之前）
+migrate_legacy_data()
+
+
+# 必须是 RLock：save_settings 会在持锁的情况下调用 load_settings，
+# 用普通 Lock 会自己把自己锁死（写设置直接卡住不返回，踩过）。
+_settings_lock = threading.RLock()
+_settings_cache = None
+
+
+def load_settings():
+    """读设置（带内存缓存）。文件不存在就用默认值。"""
+    global _settings_cache
+
+    with _settings_lock:
+        if _settings_cache is not None:
+            return _settings_cache
+
+        data = {}
+
+        try:
+            path = _settings_path()
+
+            if path.is_file():
+                data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"[warn] 读取设置失败，改用默认值: {exc}")
+
+        if not isinstance(data, dict):
+            data = {}
+
+        merged = {
+            "download_dir": str(default_download_dir()),
+        }
+
+        merged.update(
+            {k: v for k, v in data.items() if k in merged}
+        )
+
+        _settings_cache = merged
+
+        return merged
+
+
+def save_settings(patch):
+    """合并写入设置。"""
+    global _settings_cache
+
+    with _settings_lock:
+        current = dict(load_settings())
+        current.update(
+            {k: v for k, v in (patch or {}).items() if k in current}
+        )
+
+        try:
+            path = _settings_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(current, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            print(f"[warn] 写设置失败: {exc}")
+
+        _settings_cache = current
+
+        return current
+
+
+def downloads_dir():
+    """实际使用的下载目录（设置里改过就用改过的）。"""
+    configured = str(load_settings().get("download_dir") or "").strip()
+
+    if configured:
+        return __import__("pathlib").Path(configured)
+
+    return default_download_dir()
+
+
+# ---------- 下载记录（落盘，重启不丢） ----------
+
+def _records_path():
+    return hanime_root() / "downloads.json"
+
+    # 说明：记录跟着「根目录」走，不跟着下载目录走 ——
+    # 用户改下载目录时不该把历史记录一起丢掉。
+
+
+def _load_records():
+    try:
+        path = _records_path()
+
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+
+            if isinstance(data, list):
+                return {
+                    str(r.get("video_id")): r
+                    for r in data
+                    if isinstance(r, dict) and r.get("video_id")
+                }
+    except Exception as exc:
+        print(f"[warn] 读下载记录失败: {exc}")
+
+    return {}
+
+
+def _write_records(records):
+    try:
+        path = _records_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        path.write_text(
+            json.dumps(list(records.values()), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        print(f"[warn] 写下载记录失败: {exc}")
+
+
+def _save_records():
+    """把当前所有任务合并进记录文件。
+
+    存的时候去掉 `url` —— 官网的视频地址带签名会过期，
+    留着只会让下次重启后拿着一个失效链接去重试。
+    """
+    records = _load_records()
+
+    with _DOWNLOAD_LOCK:
+        for video_id, job in _downloads.items():
+            records[video_id] = {
+                k: v for k, v in job.items() if k != "url"
+            }
+
+    _write_records(records)
+
+
+def _safe_filename(name, fallback="video"):
+    """把标题变成合法文件名。
+
+    Windows 不允许 \\ / : * ? " < > | 这些字符。
+    另外详情页的 title 会带着站点后缀，比如
+    「XXX - H動漫/裏番/線上看 - Hanime1.me」，要一起剪掉。
+    """
+    text = str(name)
+
+    # 先把各种「看不见的空格」统一成普通空格。
+    #
+    # 官网标题用的其实是**不换行空格** \xa0：
+    #   '...[中文字幕]\xa0-\xa0H動漫/裏番/線上看\xa0-\xa0Hanime1.me'
+    # 以前直接按普通空格找 " - H動漫"，永远找不到，
+    # 结果站点后缀原封不动留在了文件名里（下出来一个几十字的长名字）。
+    for space in ("\u00a0", "\u3000", "\u2007", "\u202f", "\u2009"):
+        text = text.replace(space, " ")
+
+    # 剪掉站点后缀
+    for sep in (" - H動漫", " - H动漫", " | Hanime1", " - Hanime1"):
+        idx = text.find(sep)
+
+        if idx != -1:
+            text = text[:idx]
+
+    # 兜底：万一还有 Hanime1 字样，从那里截断
+    for tail in ("Hanime1.me", "Hanime1"):
+        idx = text.find(tail)
+
+        if idx != -1:
+            text = text[:idx].rstrip(" -|")
+
+    cleaned = "".join(
+        ("_" if c in '\\/:*?"<>|' else c) for c in text
+    )
+
+    cleaned = " ".join(cleaned.split()).strip(" .")
+
+    if not cleaned:
+        cleaned = fallback
+
+    # 留点余量给扩展名和可能的同名后缀
+    return cleaned[:110]
+
+
+def _browser_cookies():
+    """取调试浏览器里 hanime1.me 的 cookie，拼成 Cookie 头。"""
+    chrome = ChromeCDP()
+
+    raw = chrome.evaluate(
+        "(()=>{try{return document.cookie||'';}catch(e){return '';}})()"
+    ).get("value") or ""
+
+    return raw
+
+
+def _download_worker(video_id):
+    """后台下载线程。"""
+    import urllib.request as _url
+    import urllib.error as _urlerr
+
+    with _DOWNLOAD_LOCK:
+        job = _downloads.get(video_id)
+
+    if not job:
+        return
+
+    url = job["url"]
+    title = job["title"]
+
+    try:
+        target_dir = downloads_dir()
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # 扩展名从 URL 推断，默认 mp4
+        ext = ".mp4"
+
+        low = url.split("?")[0].lower()
+
+        for cand in (".mp4", ".mkv", ".webm", ".m3u8", ".ts"):
+            if low.endswith(cand):
+                ext = cand
+                break
+
+        base = _safe_filename(title, fallback=video_id)
+
+        path = target_dir / f"{base}{ext}"
+
+        # 重名就加序号，避免覆盖
+        counter = 1
+
+        while path.exists():
+            path = target_dir / f"{base} ({counter}){ext}"
+            counter += 1
+
+        cookie = _browser_cookies()
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/154.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://hanime1.me/",
+        }
+
+        if cookie:
+            headers["Cookie"] = cookie
+
+        request = _url.Request(url, headers=headers)
+
+        with _url.urlopen(request, timeout=60) as response:
+            total = int(response.headers.get("Content-Length") or 0)
+
+            with _DOWNLOAD_LOCK:
+                job["total"] = total
+                job["path"] = str(path)
+
+            received = 0
+            chunk = 1024 * 256
+
+            with open(path, "wb") as handle:
+                while True:
+                    with _DOWNLOAD_LOCK:
+                        if job["status"] == "cancelled":
+                            handle.close()
+
+                            try:
+                                path.unlink()
+                            except Exception:
+                                pass
+
+                            return
+
+                    block = response.read(chunk)
+
+                    if not block:
+                        break
+
+                    handle.write(block)
+                    received += len(block)
+
+                    with _DOWNLOAD_LOCK:
+                        job["received"] = received
+                        job["percent"] = (
+                            round(received * 100.0 / total, 1)
+                            if total
+                            else 0.0
+                        )
+
+        with _DOWNLOAD_LOCK:
+            job["status"] = "done"
+            job["percent"] = 100.0 if total else job["percent"]
+            job["path"] = str(path)
+
+        _save_records()
+
+    except _urlerr.HTTPError as exc:
+        with _DOWNLOAD_LOCK:
+            job["status"] = "failed"
+            job["error"] = (
+                f"服务器返回 {exc.code}"
+                + ("（登录状态可能已失效）" if exc.code in (401, 403) else "")
+            )
+
+        _save_records()
+
+    except Exception as exc:
+        with _DOWNLOAD_LOCK:
+            job["status"] = "failed"
+            job["error"] = str(exc)
+
+        _save_records()
 
 
 # ==========================================================
@@ -84,6 +626,18 @@ def fetch_html(
 ):
     """取指定 URL 的 HTML。命中缓存时直接返回，不再访问 Chrome。
 
+    取页分两级，先快后稳：
+
+    1. **快速通道**：在常驻页里 `fetch()` 拿 HTML，**不做整页导航**。
+       整页导航要拆旧页面 + 重建 DOM + 加载图片脚本，实测约 1130ms；
+       在已加载的页里 fetch 一次只要约 540ms（快 2 倍多）。
+       本站页面是服务端渲染的，HTML 里本来就有全部内容 ——
+       逐项对比过 navigage / fetch / 普通 HTTP 三种取法，
+       卡片数、播放地址、清晰度列表、互动状态完全一致。
+
+    2. **兜底**：快速通道失败（浏览器不在本站、拿到 Cloudflare 拦截页、
+       非 200）就退回整页导航，保证不会因为提速而拿不到数据。
+
     返回 (html, from_cache)。
     """
     if cache is not None:
@@ -95,19 +649,49 @@ def fetch_html(
     with _NAVIGATE_LOCK:
         chrome = ChromeCDP()
 
-        ready, html = chrome.navigate_and_wait(
-            url,
-            ready_selector=ready_selector,
-            all_selectors=all_selectors,
-            timeout=timeout,
-            min_stable=min_stable,
-        )
+        html = ""
+        via = ""
 
-        if not ready:
-            print(f"[warn] 等待页面就绪超时: {url}")
+        try:
+            ok, fast_html = chrome.fetch_document(url, timeout=timeout)
+
+            if ok:
+                html = fast_html
+                via = "fetch"
+            else:
+                print(f"[info] 快速通道不可用（{fast_html}），改用整页导航: {url}")
+
+                # 浏览器不在本站时先回一次首页（就这一次，之后一直复用）
+                if fast_html == "WRONG_ORIGIN":
+                    chrome.ensure_site_loaded(timeout=timeout)
+
+                    ok, fast_html = chrome.fetch_document(url, timeout=timeout)
+
+                    if ok:
+                        html = fast_html
+                        via = "fetch"
+        except Exception as exc:
+            print(f"[info] 快速通道异常（{exc}），改用整页导航: {url}")
+
+        if not html:
+            ready, nav_html = chrome.navigate_and_wait(
+                url,
+                ready_selector=ready_selector,
+                all_selectors=all_selectors,
+                timeout=timeout,
+                min_stable=min_stable,
+            )
+
+            if not ready:
+                print(f"[warn] 等待页面就绪超时: {url}")
+
+            html = nav_html or ""
+            via = "navigate"
 
         if not html:
             raise Exception(f"获取 HTML 失败: {url}")
+
+        print(f"[fetch] {via}: {url}")
 
     if cache is not None:
         cache.set(url, html)
@@ -169,6 +753,244 @@ def shutdown(exit_process: bool = True):
             os._exit(0)
 
     threading.Thread(target=_cleanup, daemon=True).start()
+
+    return {"ok": True}
+
+
+@app.get("/api/settings")
+def get_settings():
+    """应用设置（目前只有下载目录是可改的后端设置）。"""
+    current = load_settings()
+
+    return {
+        "download_dir": str(downloads_dir()),
+        "default_download_dir": str(default_download_dir()),
+        "hanime_root": str(hanime_root()),
+    }
+
+
+@app.post("/api/settings")
+def update_settings(payload: dict = None):
+    """改设置。目前只接受 download_dir。"""
+    body = payload or {}
+
+    patch = {}
+
+    if "download_dir" in body:
+        target = str(body.get("download_dir") or "").strip()
+
+        if not target:
+            raise HTTPException(status_code=400, detail="下载目录不能为空")
+
+        # 目录不存在就建出来，免得用户填了却下不进去
+        try:
+            import pathlib as _pathlib
+
+            _pathlib.Path(target).mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"这个目录建不出来：{exc}",
+            )
+
+        patch["download_dir"] = target
+
+    current = save_settings(patch)
+
+    return {
+        "ok": True,
+        "download_dir": str(downloads_dir()),
+        "settings": current,
+    }
+
+
+@app.get("/api/download/dir")
+def download_dir():
+    """下载目录（客户端「打开文件夹」会用到）。"""
+    return {
+        "dir": str(downloads_dir()),
+        "exists": downloads_dir().is_dir(),
+        "default_dir": str(default_download_dir()),
+    }
+
+
+@app.post("/api/download/{video_id}")
+def start_download(video_id: str, payload: dict = None):
+    """把影片下载到本地。
+
+    用浏览器里那套 cookie 去取视频流 —— 官网的 mp4 地址带签名，
+    直接下载会 403，必须复用已登录的会话。
+
+    请求体（可选）：
+      {"quality": "1080p"}   不填就选最高画质
+    """
+    payload = payload or {}
+
+    want_quality = str(payload.get("quality", "")).strip()
+
+    with _DOWNLOAD_LOCK:
+        if video_id in _downloads:
+            job = _downloads[video_id]
+
+            if job["status"] == "downloading":
+                return {"ok": True, "job": job, "message": "这个影片正在下载中"}
+
+    try:
+        detail = _build_detail(video_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"读取影片信息失败：{exc}")
+
+    sources = detail.get("sources") or []
+
+    if not sources:
+        raise HTTPException(
+            status_code=400,
+            detail="这个影片没有可直接下载的地址（可能是外部嵌入播放器）",
+        )
+
+    picked = None
+
+    if want_quality:
+        picked = next(
+            (s for s in sources if str(s.get("quality")) == want_quality),
+            None,
+        )
+
+    if picked is None:
+        # sources 已按画质从高到低排好
+        picked = sources[0]
+
+    url = picked.get("url") or ""
+
+    if not url:
+        raise HTTPException(status_code=400, detail="下载地址为空")
+
+    title = detail.get("title") or video_id
+
+    job = {
+        "video_id": video_id,
+        "title": title,
+        "quality": picked.get("quality") or "",
+        "url": url,
+        "status": "downloading",
+        "received": 0,
+        "total": 0,
+        "percent": 0.0,
+        "path": "",
+        "error": "",
+        "thumbnail": detail.get("thumbnail") or "",
+        "started_at": time.time(),
+    }
+
+    with _DOWNLOAD_LOCK:
+        _downloads[video_id] = job
+
+    _save_records()
+
+    threading.Thread(
+        target=_download_worker,
+        args=(video_id,),
+        daemon=True,
+    ).start()
+
+    return {"ok": True, "job": job}
+
+
+@app.get("/api/download/{video_id}")
+def download_status(video_id: str):
+    with _DOWNLOAD_LOCK:
+        job = _downloads.get(video_id)
+
+    if not job:
+        return {"found": False}
+
+    return {"found": True, "job": job}
+
+
+@app.get("/api/downloads")
+def list_downloads():
+    """下载记录 = 正在跑的任务 + 以前存下来的历史。
+
+    以前只返回内存里的任务，后端一重启记录就全没了，
+    下载管理页也就没东西可看。现在落盘到
+    `<Hanime 根目录>/downloads.json`，重启后还在。
+    """
+    with _DOWNLOAD_LOCK:
+        jobs = {vid: dict(job) for vid, job in _downloads.items()}
+
+    for vid, record in _load_records().items():
+        if vid in jobs:
+            continue
+
+        item = dict(record)
+
+        # 上次没下完、进程就没了 —— 线程早不存在了，标成「已中断」
+        if item.get("status") == "downloading":
+            item["status"] = "interrupted"
+
+        jobs[vid] = item
+
+    for job in jobs.values():
+        path = job.get("path") or ""
+
+        job["file_exists"] = bool(path) and os.path.isfile(path)
+
+        # 本地找不到文件的任务，别让它一直显示"已完成"
+        if job.get("status") == "done" and not job["file_exists"]:
+            job["status"] = "missing"
+
+    ordered = sorted(
+        jobs.values(),
+        key=lambda j: j.get("started_at", 0),
+        reverse=True,
+    )
+
+    return {"dir": str(downloads_dir()), "jobs": ordered}
+
+
+@app.post("/api/downloads/{video_id}/remove")
+def remove_download(video_id: str, payload: dict = None):
+    """删掉一条下载记录；delete_file 为真时连硬盘上的文件一起删。"""
+    body = payload or {}
+    delete_file = bool(body.get("delete_file"))
+
+    with _DOWNLOAD_LOCK:
+        job = _downloads.pop(video_id, None)
+
+    records = _load_records()
+    record = records.pop(video_id, None)
+
+    _write_records(records)
+
+    target = (job or record or {}).get("path") or ""
+    removed_file = False
+
+    if delete_file and target and os.path.isfile(target):
+        try:
+            os.remove(target)
+            removed_file = True
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"删文件失败：{exc}"
+            )
+
+    if not job and not record:
+        raise HTTPException(status_code=404, detail="没有这条下载记录")
+
+    return {"ok": True, "removed_file": removed_file, "path": target}
+
+
+@app.post("/api/download/{video_id}/cancel")
+def cancel_download(video_id: str):
+    with _DOWNLOAD_LOCK:
+        job = _downloads.get(video_id)
+
+        if not job:
+            raise HTTPException(status_code=404, detail="没有这个下载任务")
+
+        job["status"] = "cancelled"
+
+    _save_records()
 
     return {"ok": True}
 
@@ -485,6 +1307,14 @@ def filter_videos(
                 "views": card.views
             })
 
+        # 封面真实比例（有些栏目是竖版，有些是横版）。
+        # 客户端据此决定卡片画成竖的还是横的 —— 实测
+        # 「新番預告」的封面是 268x394 竖版，按 16:9 画会裁掉一大半。
+        try:
+            results = _attach_thumbnail_sizes(results, limit=24)
+        except Exception:
+            pass
+
         return {
             "query": query,
             "genre": genre,
@@ -564,8 +1394,129 @@ def search_videos(query: str):
         )
 
 
+# ==========================================================
+# 封面尺寸缓存
+# ==========================================================
+#
+# 详情页 / 筛选页要按封面真实比例渲染（竖版 0.68、横版 16:9），
+# 而图片带签名、外部拿不到尺寸，只能在浏览器里加载量一遍。
+#
+# 之前每次冷加载都要**串行**量 59 张，多花约 2 秒，这就是
+# 「详情页加载慢」的主因。两个优化：
+#   1. 并行量（Promise.all），59 张一起加载，比串行快很多。
+#   2. 按 URL 路径缓存尺寸（同一个封面换签名也不影响），
+#      下次直接命中，完全不再量。
+_thumb_size_cache = {}
+_THUMB_CACHE_LOCK = threading.Lock()
+
+
+def _thumb_cache_key(url):
+    # 去掉 ?secure=... 签名：同一张图尺寸不会变，换签名不该失效
+    return url.split("?", 1)[0]
+
+
+def _thumb_orientation(ratio):
+    if ratio > 1.15:
+        return "landscape"
+
+    if ratio < 0.87:
+        return "portrait"
+
+    return "square"
+
+
+def _attach_thumbnail_sizes(related, limit=60):
+    """给影片列表补上封面的真实宽高（带缓存 + 并行）。"""
+    if not related:
+        return related
+
+    uncached_urls = []
+    uncached_indices = []
+
+    for index, item in enumerate(related[:limit]):
+        url = item.get("thumbnail") or ""
+
+        if not url:
+            continue
+
+        key = _thumb_cache_key(url)
+
+        with _THUMB_CACHE_LOCK:
+            cached = _thumb_size_cache.get(key)
+
+        if cached:
+            width, height = cached
+
+            item["thumb_width"] = width
+            item["thumb_height"] = height
+            item["thumb_ratio"] = round(width / height, 4)
+            item["thumb_orientation"] = _thumb_orientation(width / height)
+            continue
+
+        uncached_urls.append(url)
+        uncached_indices.append(index)
+
+    if not uncached_urls:
+        return related
+
+    chrome = ChromeCDP()
+
+    # 并行量：Promise.all 让浏览器同时加载所有图
+    probe = (
+        """(async () => {
+            const urls = %s;
+            const out = await Promise.all(urls.map(u => new Promise(res => {
+                if (!u) { res(null); return; }
+                const im = new Image();
+                im.onload = () => res([im.naturalWidth, im.naturalHeight]);
+                im.onerror = () => res(null);
+                im.src = u;
+            })));
+            return JSON.stringify(out);
+        })()"""
+    ) % json.dumps(uncached_urls)
+
+    raw = chrome.evaluate(probe, timeout=90, await_promise=True).get("value")
+
+    if not raw:
+        return related
+
+    sizes = json.loads(raw)
+
+    for local_index, related_index in enumerate(uncached_indices):
+        size = sizes[local_index] if local_index < len(sizes) else None
+
+        if not size or not size[0] or not size[1]:
+            continue
+
+        width, height = int(size[0]), int(size[1])
+        item = related[related_index]
+
+        item["thumb_width"] = width
+        item["thumb_height"] = height
+        item["thumb_ratio"] = round(width / height, 4)
+        item["thumb_orientation"] = _thumb_orientation(width / height)
+
+        with _THUMB_CACHE_LOCK:
+            _thumb_size_cache[_thumb_cache_key(uncached_urls[local_index])] = (
+                width,
+                height,
+            )
+
+            # 防止缓存无限膨胀
+            if len(_thumb_size_cache) > 20000:
+                _thumb_size_cache.clear()
+
+    return related
+
+
 @app.get("/api/video/{video_id}")
 def get_video(video_id: str):
+    return _build_detail(video_id)
+
+
+def _build_detail(video_id: str):
+    """读取影片详情（抽出来给下载等多处复用）。"""
     url = f"https://hanime1.me/watch?v={video_id}"
 
     try:
@@ -585,13 +1536,24 @@ def get_video(video_id: str):
 
         playlist_videos = parser.get_playlist_videos()
 
-        print("视频详情:")
-        print(detail)
+        related = parser.get_related_videos()
 
-        print("播放清单影片数量:")
-        print(len(playlist_videos))
+        # 互动状态（已点赞/已储存）直接读详情页 HTML，不用额外导航。
+        # 之前靠 /api/video/{id}/state 单独取，会多一次浏览器导航。
+        interaction = parser.get_interaction_state()
+
+        # 相关影片的封面**是竖版**（实测 268x394，比例 0.68），
+        # 而之前客户端按 16:9 横版渲染，等于把竖图裁掉一大半。
+        #
+        # 图片真实尺寸只有浏览器知道（带签名的 URL 在别处取不到），
+        # 所以在页面里加载量一遍。量完写进缓存，后续不再付这个代价。
+        try:
+            related = _attach_thumbnail_sizes(related)
+        except Exception:
+            pass
 
         return {
+            "video_id": video_id,
             "title": detail.title,
             "url": detail.url,
             "video_source": detail.video_source,
@@ -616,7 +1578,14 @@ def get_video(video_id: str):
             "tags": detail.tags,
             "playlist": playlist_videos,
             "sources": detail.sources,
-            "related": detail.related,
+            "related": related,
+            # 当前账号的互动状态（点亮图标用）
+            "liked": interaction.get("liked", False),
+            "disliked": interaction.get("disliked", False),
+            "saved": interaction.get("saved", False),
+            "saved_playlist": interaction.get("saved_playlist", ""),
+            # 储存弹窗的可选清单（页面 HTML 里就有，客户端不必再等一次导航）
+            "save_playlists": interaction.get("save_playlists", []),
             # 官方的下載按钮指向这个页面（客户端也可以直接用 video_source）
             "download_url": (
                 f"https://hanime1.me/download?v={video_id}"
@@ -788,28 +1757,123 @@ def user_profile(user_id: str, tab: str = "home", page: int = 1):
         )
 
 
+@app.post("/api/playlist/create")
+def create_playlist(payload: dict):
+    """新建播放清单（储存弹窗顶部的「新增播放清单」）。
+
+    请求体：
+      {"title": "标题（必填）",
+       "description": "详细说明（选填）",
+       "video_id": "408116"}
+    """
+    body = payload or {}
+
+    title = (body.get("title") or "").strip()
+    description = (body.get("description") or "").strip()
+    video_id = (body.get("video_id") or "").strip()
+
+    if not title:
+        raise HTTPException(status_code=400, detail="标题不能为空")
+
+    if not video_id:
+        raise HTTPException(status_code=400, detail="缺少 video_id")
+
+    try:
+        ok, message, state = auth.create_playlist(
+            video_id, title, description
+        )
+
+        if not ok:
+            raise HTTPException(status_code=400, detail=message)
+
+        # 清单列表与用户主页缓存都作废
+        playlist_cache.clear()
+        user_cache.clear()
+        detail_cache.clear()
+
+        return {"ok": True, "message": message, "state": state}
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/video/{video_id}/state")
+def video_state(video_id: str):
+    """当前账号对这个影片的状态（是否已点赞 / 已储存）。
+
+    客户端用它点亮图标 —— 点赞或储存之后只刷新这个状态，
+    不重新加载整个影片详情页。
+    """
+    try:
+        return auth.fetch_video_state(video_id)
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/video/{video_id}/playlists")
+def video_save_playlists(video_id: str):
+    """「储存」时可选的播放清单（供客户端弹选择框）。"""
+    try:
+        items = auth.fetch_playlists(video_id)
+
+        return {
+            "video_id": video_id,
+            "playlists": items,
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc)
+        )
+
+
 @app.post("/api/video/{video_id}/action")
 def video_action(video_id: str, payload: dict):
-    """点赞 / 取消点赞 / 储存。
+    """点赞 / 取消点赞 / 储存 / 取消储存。
 
-    请求体：{"action": "like" | "unlike" | "save"}
+    请求体：
+      {"action": "like" | "unlike" | "save" | "unsave",
+       "playlist": "清单名（可选）"}
 
-    实现在真实 Chrome 里触发一次真实点击，然后重新读取页面确认结果。
-    成功后详情缓存要清掉，否则前端还会看到旧的点赞数。
+    储存 / 取消储存走官网的 #video-save-form：
+    点「储存」只是弹窗，真正生效靠给清单 checkbox 派发 change
+    （服务端按 is_checked 决定加入还是移除）。
+    点赞是页内 XHR，原地读 DOM 判断是否真的生效。
     """
     action = (payload or {}).get("action", "").strip()
+    playlist = (payload or {}).get("playlist", "").strip()
 
-    if action not in ("like", "unlike", "save"):
+    if action not in ("like", "unlike", "save", "unsave"):
         raise HTTPException(
             status_code=400,
-            detail="action 必须是 like / unlike / save 之一"
+            detail="action 必须是 like / unlike / save / unsave 之一"
         )
 
     try:
-        ok, message, state = auth.video_action(video_id, action)
+        ok, message, state = auth.video_action(
+            video_id, action, playlist=playlist
+        )
 
         if ok:
             # 页面内容变了，相关缓存作废
+            detail_cache.clear()
+            user_cache.clear()
+            # 储存/取消储存会改变播放清单内容，清单缓存也要清
+            playlist_cache.clear()
+
+        elif action in ("save", "unsave"):
+            # 保险：即使复核说"没生效"，也把详情缓存清掉。
+            #
+            # 因为官网那边可能**已经改了**，只是我们的复核没能确认；
+            # 这时如果留着旧缓存，用户再进详情页会看到过期的
+            # 已储存/未储存状态（这个假失败坑过一次，症状是
+            # 明明存进「稍后观看」了，详情页的图标还是空心）。
+            # 清掉最多多一次重新抓取，代价很小。
             detail_cache.clear()
             user_cache.clear()
 
@@ -1158,6 +2222,9 @@ def get_playlist(list_id: str):
 
         videos = parser.get_playlist_videos()
 
+        # 右上角书签的收藏状态（实心=已收藏），也在这张页面 HTML 里
+        bookmark = parser.get_playlist_bookmark_state()
+
         print("播放清单影片数量:")
         print(len(videos))
 
@@ -1165,6 +2232,9 @@ def get_playlist(list_id: str):
             "list_id": list_id,
             "url": url,
             "title": parser.get_title(),
+            "bookmarked": bookmark.get("bookmarked", False),
+            # 自己的清单没有书签表单，客户端据此隐藏/禁用书签
+            "can_bookmark": bookmark.get("can_bookmark", False),
             "results": videos
         }
 
@@ -1176,3 +2246,39 @@ def get_playlist(list_id: str):
             status_code=500,
             detail=str(exc)
         )
+
+
+@app.post("/api/playlist/{list_id}/bookmark")
+def toggle_playlist_bookmark(list_id: str):
+    """收藏 / 取消收藏一个播放清单（对应官网右上角的书签）。
+
+    官网机制（从页面 HTML 读出来的）：
+      <form id="playlist-show-add-form" method="POST"
+            action="https://hanime1.me/addPlaylist">
+        <input type="hidden" name="_token" ...>
+        <input type="hidden" name="playlist-reference-id" value="976998">
+      </form>
+    POST 一次就**切换**收藏状态。
+
+    返回切换后的状态，客户端据此点亮/熄灭书签。
+    """
+    if not list_id:
+        raise HTTPException(status_code=400, detail="list_id 不能为空")
+
+    try:
+        ok, message, state = auth.toggle_playlist_bookmark(list_id)
+
+        if not ok:
+            raise HTTPException(status_code=400, detail=message)
+
+        # 收藏状态变了，清单相关缓存作废
+        playlist_cache.clear()
+        user_cache.clear()
+
+        return {"ok": True, "message": message, "state": state}
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))

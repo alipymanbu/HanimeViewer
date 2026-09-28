@@ -1,4 +1,4 @@
-import 'dart:convert';
+﻿import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -7,6 +7,9 @@ import 'main.dart';
 import 'controllers/app_cache.dart';
 import 'widgets/windows11_loading.dart';
 import 'controllers/app_config.dart';
+import './widgets/app_toast.dart';
+import 'widgets/pager_bar.dart';
+import 'widgets/video_card.dart';
 
 class CategoryPage extends StatefulWidget {
   final String title;
@@ -253,51 +256,13 @@ class _CategoryPageState
     } catch (e) {
       if (!mounted) return;
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('标签加载失败：$e')),
-      );
+      AppToast.error(context, '标签加载失败：$e');
     }
   }
 
   void _applyFilter() {
     _page = 1;
     _loadVideos(page: 1);
-  }
-
-  void _previousPage() {
-    if (_page <= 1 || _loading) {
-      return;
-    }
-
-    _loadVideos(page: _page - 1);
-  }
-
-  void _nextPage() {
-    if (_page >= _totalPages || _loading) {
-      return;
-    }
-
-    _loadVideos(page: _page + 1);
-  }
-
-  Future<void> _showPageJumpDialog() async {
-    final page = await showDialog<int>(
-      context: context,
-      builder: (dialogContext) {
-        return _PageJumpDialog(
-          currentPage: _page,
-          totalPages: _totalPages,
-        );
-      },
-    );
-
-    if (!mounted) return;
-
-    if (page == null || page == _page) {
-      return;
-    }
-
-    await _loadVideos(page: page);
   }
 
   Future<void> _showTagDialog() async {
@@ -347,89 +312,6 @@ class _CategoryPageState
     );
   }
 
-  int _columnsFor(double width) {
-    if (_isPortraitCategory) {
-      if (width >= 1600) return 8;
-      if (width >= 1300) return 7;
-      if (width >= 1000) return 5;
-      if (width >= 750) return 4;
-      if (width >= 500) return 2;
-      return 1;
-    }
-
-    if (width >= 1600) return 6;
-    if (width >= 1300) return 5;
-    if (width >= 1000) return 4;
-    if (width >= 750) return 3;
-    if (width >= 500) return 2;
-    return 1;
-  }
-  
-  Widget _buildCard(Map<String, dynamic> video) {
-    final thumbnail =
-        video['thumbnail']?.toString() ?? '';
-    final title = video['title']?.toString() ?? '';
-    final duration =
-        video['duration']?.toString() ?? '';
-    final rating = video['rating']?.toString() ?? '';
-    final views = video['views']?.toString() ?? '';
-
-    final meta = [duration, rating, views]
-        .where((v) => v.isNotEmpty)
-        .join(' · ');
-
-    return Card(
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: () => _openVideo(video),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            AspectRatio(
-              aspectRatio:
-                  _isPortraitCategory ? 268 / 394 : 16 / 9,
-              child: thumbnail.isNotEmpty
-                  ? Image.network(
-                      thumbnail,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, _, _) => Container(
-                        color: Colors.black12,
-                        alignment: Alignment.center,
-                        child: const Icon(Icons.broken_image),
-                      ),
-                    )
-                  : Container(
-                      color: Colors.black12,
-                      alignment: Alignment.center,
-                      child: const Icon(Icons.image_not_supported),
-                    ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
-              child: Text(
-                title,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontWeight: FontWeight.w600),
-              ),
-            ),
-            if (meta.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-                child: Text(
-                  meta,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              )
-            else
-              const SizedBox(height: 12),
-          ],
-        ),
-      ),
-    );
-  }
 
   Widget _buildFilterBar() {
     final hasActiveFilter = _selectedSort != widget.sort ||
@@ -710,175 +592,23 @@ class _CategoryPageState
             onRefresh: () {
               return _loadVideos(page: _page);
             },
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                final columns =
-                    _columnsFor(constraints.maxWidth);
-
-                const horizontalPadding = 48.0;
-                const crossAxisSpacing = 16.0;
-
-                final availableWidth =
-                    constraints.maxWidth -
-                        horizontalPadding -
-                        crossAxisSpacing * (columns - 1);
-                final itemWidth = availableWidth / columns;
-                final thumbnailHeight = _isPortraitCategory
-                    ? itemWidth * 394 / 268
-                    : itemWidth * 9 / 16;
-                final itemHeight = thumbnailHeight + 92;
-
-                return GridView.builder(
-                  padding: const EdgeInsets.all(24),
-                  gridDelegate:
-                      SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: columns,
-                    crossAxisSpacing: crossAxisSpacing,
-                    mainAxisSpacing: 16,
-                    mainAxisExtent: itemHeight,
-                  ),
-                  itemCount: _videos.length,
-                  itemBuilder: (_, index) =>
-                      _buildCard(_videos[index]),
-                );
-              },
+            // 尺寸和首页统一（见 widgets/video_card.dart）
+            child: VideoCardGrid(
+              videos: _videos,
+              padding: const EdgeInsets.all(24),
+              portrait: _isPortraitCategory,
+              aspectRatio: _isPortraitCategory ? 268 / 394 : 16 / 9,
+              onTap: _openVideo,
             ),
           ),
         ),
 
-        Padding(
-          padding: const EdgeInsets.fromLTRB(
-            18,
-            6,
-            18,
-            14,
-          ),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              OutlinedButton.icon(
-                onPressed: _page > 1 && !_loading
-                    ? _previousPage
-                    : null,
-                icon: const Icon(Icons.chevron_left),
-                label: const Text('上一页'),
-              ),
-              const SizedBox(width: 16),
-              InkWell(
-                borderRadius: BorderRadius.circular(8),
-                onTap: _loading ? null : _showPageJumpDialog,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 8,
-                  ),
-                  child: Text(
-                    '第 $_page / $_totalPages 页',
-                    style: TextStyle(
-                      fontWeight: FontWeight.w600,
-                      color: _loading
-                          ? Colors.grey
-                          : Theme.of(context)
-                              .colorScheme
-                              .primary,
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 16),
-              OutlinedButton.icon(
-                onPressed:
-                    _page < _totalPages && !_loading
-                        ? _nextPage
-                        : null,
-                icon: const Icon(Icons.chevron_right),
-                label: const Text('下一页'),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _PageJumpDialog extends StatefulWidget {
-  final int currentPage;
-  final int totalPages;
-
-  const _PageJumpDialog({
-    required this.currentPage,
-    required this.totalPages,
-  });
-
-  @override
-  State<_PageJumpDialog> createState() =>
-      _PageJumpDialogState();
-}
-
-class _PageJumpDialogState
-    extends State<_PageJumpDialog> {
-  late final TextEditingController _controller;
-
-  @override
-  void initState() {
-    super.initState();
-
-    _controller = TextEditingController(
-      text: widget.currentPage.toString(),
-    );
-  }
-
-  void _submit() {
-    final page = int.tryParse(_controller.text.trim());
-
-    if (page == null ||
-        page < 1 ||
-        page > widget.totalPages) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            '请输入 1~${widget.totalPages} 之间的页码',
-          ),
-        ),
-      );
-      return;
-    }
-
-    Navigator.of(context).pop(page);
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('跳转到页码'),
-      content: TextField(
-        controller: _controller,
-        autofocus: true,
-        keyboardType: TextInputType.number,
-        decoration: InputDecoration(
-          labelText: '页码',
-          hintText: '请输入 1~${widget.totalPages}',
-          border: const OutlineInputBorder(),
-        ),
-        onSubmitted: (_) => _submit(),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () {
-            Navigator.of(context).pop();
-          },
-          child: const Text('取消'),
-        ),
-        FilledButton(
-          onPressed: _submit,
-          child: const Text('跳转'),
+        PagerBar(
+          page: _page,
+          totalPages: _totalPages,
+          loading: _loading,
+          padding: const EdgeInsets.fromLTRB(18, 6, 18, 14),
+          onGoToPage: (target) => _loadVideos(page: target),
         ),
       ],
     );

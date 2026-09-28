@@ -1,4 +1,4 @@
-import 'dart:convert';
+﻿import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -10,6 +10,11 @@ import 'playlist_detail_page.dart';
 import 'utils/user_tabs.dart';
 import 'widgets/windows11_loading.dart';
 import 'controllers/app_config.dart';
+import 'login_dialog.dart';
+import './widgets/app_toast.dart';
+import 'widgets/pager_bar.dart';
+import 'controllers/data_revision.dart';
+import 'widgets/video_card.dart';
 
 /// 用户 / 发行商主页。
 ///
@@ -63,9 +68,37 @@ class _UserProfilePageState extends State<UserProfilePage>
 
   /// 点赞过的影片只有登录自己的主页才看得到
   bool get _isSelf {
+    // 退出登录后就地切换时，用覆盖值判断（此时账号已经没了）
+    if (_selfOverride) return true;
+
     final mine = AuthController.account.value.userId;
 
-    return mine.isNotEmpty && mine == widget.userId;
+    return mine.isNotEmpty && mine == _effectiveUserId;
+  }
+
+  /// 当前页面实际作用的用户 id。
+  ///
+  /// 平时等于 widget.userId，但退出登录后要就地切回「自己」，
+  /// 这时候 widget 的值已经过期了，所以用这个可变字段。
+  String _effectiveUserId = '';
+
+  /// 退出登录 / 就地登录之后用来覆盖 tab 列表（null 表示按 _isSelf 推导）
+  List<({String key, String label, IconData icon})>? _tabsOverride;
+
+  /// 是否把自己当作「本人主页」（退出登录后仍为 true，好显示登录引导）
+  bool _selfOverride = false;
+
+  /// 栏目段各自的横向滚动控制器（滑块需要它）。
+  ///
+  /// key 用「序号 + 栏目名」：官网偶尔会有重名栏目，
+  /// 只用名字会让两个栏目共用同一个 controller。
+  final Map<String, ScrollController> _sectionControllers = {};
+
+  ScrollController controllerForSection(int index, String name) {
+    return _sectionControllers.putIfAbsent(
+      '$index::$name',
+      () => ScrollController(),
+    );
   }
 
   /// 个人中心的那 5 个 tab（顺序和官网一致）。
@@ -73,6 +106,8 @@ class _UserProfilePageState extends State<UserProfilePage>
   /// 看别人的主页时，觀看紀錄 / 稍後觀看 / 讚好的影片 是私密的、拿不到，
   /// 所以只保留主页 + 上传的影片 + 播放清单。
   List<({String key, String label, IconData icon})> get _tabs {
+    if (_tabsOverride != null) return _tabsOverride!;
+
     const icons = {
       'home': Icons.dashboard_outlined,
       'histories': Icons.history,
@@ -94,16 +129,42 @@ class _UserProfilePageState extends State<UserProfilePage>
     ];
   }
 
+  /// 生成 tab 列表（带图标），给需要直接赋值的场景用
+  List<({String key, String label, IconData icon})> _buildTabs({
+    required bool self,
+  }) {
+    const icons = {
+      'home': Icons.dashboard_outlined,
+      'histories': Icons.history,
+      'saves': Icons.watch_later_outlined,
+      'likes': Icons.thumb_up_outlined,
+      'playlists': Icons.playlist_play,
+      'uploaded': Icons.movie_outlined,
+    };
+
+    final source = self ? selfProfileTabs : otherProfileTabs;
+
+    return [
+      for (final t in source)
+        (
+          key: t.key,
+          label: t.label,
+          icon: icons[t.key] ?? Icons.circle_outlined,
+        ),
+    ];
+  }
+
   /// 栏目段的「查看更多」要跳到哪个 tab。
   ///
   /// 规则见 utils/user_tabs.dart（那里可以单独测）。
   String? _tabKeyFromUrl(String url) =>
-      tabKeyFromUrl(url, widget.userId);
+      tabKeyFromUrl(url, _effectiveUserId);
 
   @override
   void initState() {
     super.initState();
 
+    _effectiveUserId = widget.userId;
     _tab = widget.initialTab;
     _name = widget.initialName;
 
@@ -118,19 +179,42 @@ class _UserProfilePageState extends State<UserProfilePage>
       _tabController!.index = index;
     }
 
+    // 别处改了数据（比如在影片详情里取消储存）时静默刷新，
+    // 这样返回本页看到的就是最新的，不用手动点刷新。
+    DataRevision.revision.addListener(_onDataChanged);
+
     _load();
   }
 
   @override
   void dispose() {
+    DataRevision.revision.removeListener(_onDataChanged);
+
     _tabController?.dispose();
+
+    for (final c in _sectionControllers.values) {
+      c.dispose();
+    }
+
+    _sectionControllers.clear();
+
     super.dispose();
+  }
+
+  /// 全局数据变了：静默刷新当前 tab（保留内容、不转圈）
+  void _onDataChanged() {
+    if (!mounted) return;
+
+    // 没登录时这个页面是登录引导页，没什么可刷新的
+    if (!AuthController.isLoggedIn) return;
+
+    _load(tab: _tab, page: _page, silent: true);
   }
 
   /// 退出登录（只有自己的主页才会显示这个入口）。
   ///
-  /// 退出后本地数据会切回「未登录」作用域，
-  /// 所以顺手把页面关掉，回到主界面避免看到过期内容。
+  /// 退出后**不关闭页面**，而是就地刷新成「未登录」的个人主页 ——
+  /// 这样用户能直接看到登录入口，而不是被弹回主界面。
   Future<void> _logout() async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -156,52 +240,181 @@ class _UserProfilePageState extends State<UserProfilePage>
 
     if (confirmed != true) return;
 
+    // 清掉本地缓存的账号资料，避免退出后还显示旧账号内容。
+    //
+    // 注意前缀要和实际写入的 key 对得上：用户主页的 key 是
+    // `/api/user/{id}?tab=...`（见 AppCache.buildKey 的用法）。
+    // 之前这里写的是 'user_' 和 'video_detail_' —— 两个都匹配不到任何
+    // 真实 key，等于没清（`video_detail_` 更是早就不用了）。
+    AppCache.removeWherePrefix('/api/user/');
+
     await AuthController.logout();
 
     if (!mounted) return;
 
-    // 关掉个人主页，回主界面（主界面会跟着账号变化重建）
-    Navigator.of(context).pop();
+    // 就地切成「未登录」视图
+    setState(() {
+      _selfOverride = true;
+      _tabsOverride = _buildTabs(self: true);
+      _sections = [];
+      _videos = [];
+      _playlists = [];
+      _error = null;
+      _loading = false;
+      _tab = _tabsOverride!.first.key;
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('已退出登录')),
+      _tabController?.dispose();
+      _tabController = TabController(
+        length: _tabsOverride!.length,
+        vsync: this,
+      );
+    });
+
+    AppToast.show(context, '已退出登录');
+  }
+
+  /// 未登录时的个人主页：告诉用户登录后能看到什么，并给登录入口。
+  Widget _buildLoggedOut(ThemeData theme) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.account_circle_outlined,
+              size: 76,
+              color: theme.colorScheme.primary.withValues(alpha: 0.55),
+            ),
+            const SizedBox(height: 18),
+            const Text(
+              '还没有登录',
+              style: TextStyle(
+                fontSize: 19,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: 380,
+              child: Text(
+                '登录后可以查看自己的观看记录、稍后观看、赞好的影片和播放清单，'
+                '也能直接对影片点赞和储存（会同步到官网账号）。',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 13,
+                  height: 1.6,
+                  color: theme.colorScheme.onSurface
+                      .withValues(alpha: 0.65),
+                ),
+              ),
+            ),
+            const SizedBox(height: 22),
+            FilledButton.icon(
+              onPressed: _openLogin,
+              icon: const Icon(Icons.login),
+              label: const Text('登录'),
+              style: FilledButton.styleFrom(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 26,
+                  vertical: 14,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
+  }
+
+  /// 在当前页面里登录，登录成功后自动加载自己的资料。
+  Future<void> _openLogin() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (_) => const LoginDialog(),
+    );
+
+    if (ok != true || !mounted) return;
+
+    final info = AuthController.account.value;
+
+    setState(() {
+      _effectiveUserId = info.userId;
+      _selfOverride = true;
+      _tabsOverride = _buildTabs(self: true);
+      _name = info.username;
+      _avatar = info.avatar;
+      _error = null;
+      _loading = true;
+      _tab = _tabsOverride!.first.key;
+
+      _tabController?.dispose();
+      _tabController = TabController(
+        length: _tabsOverride!.length,
+        vsync: this,
+      );
+    });
+
+    await _load();
   }
 
   /// 加载某个 tab 的内容。
   ///
   /// [page] 只对列表类 tab 有效（每页 60 条）；主页不需要翻页。
-  Future<void> _load({String? tab, int page = 1}) async {
+  ///
+  /// [silent] 为 true 时是「静默刷新」：保留屏幕上已有的内容，
+  /// 不显示整页转圈，后台取到新数据后原地替换。
+  /// 用在「从影片详情返回」这类场景 —— 用户可能刚改了储存状态，
+  /// 列表要跟着变，但不该先白屏一次。
+  Future<void> _load({
+    String? tab,
+    int page = 1,
+    bool silent = false,
+  }) async {
     final target = tab ?? _tab;
 
     // 主页没有分页，固定第 1 页
     final targetPage = target == 'home' ? 1 : (page < 1 ? 1 : page);
 
-    setState(() {
-      _tab = target;
-      _page = targetPage;
-      _loading = true;
-      _error = null;
-      _videos = [];
-      _playlists = [];
-      _sections = [];
-    });
-
     // 「主页」走栏目段接口，其余 tab 走普通列表接口
     final path = target == 'home'
-        ? '/api/user/${widget.userId}/home'
-        : '/api/user/${widget.userId}';
+        ? '/api/user/$_effectiveUserId/home'
+        : '/api/user/$_effectiveUserId';
 
     final cacheKey = AppCache.buildKey(
       path,
       target == 'home' ? {'tab': target} : {'tab': target, 'page': targetPage},
     );
 
-    final cached = AppCache.get(cacheKey);
+    final switching = target != _tab || targetPage != _page;
 
-    if (cached is Map) {
-      _apply(Map<String, dynamic>.from(cached));
-      return;
+    // 先拿缓存：有的话立刻显示，不用等请求
+    Map<String, dynamic>? cached;
+
+    if (!silent) {
+      final hit = AppCache.get(cacheKey);
+
+      if (hit is Map) cached = Map<String, dynamic>.from(hit);
+    }
+
+    setState(() {
+      _tab = target;
+      _page = targetPage;
+      _error = null;
+
+      // 换 tab / 翻页才清掉旧内容（避免显示上一个 tab 的数据）
+      if (switching) {
+        _videos = [];
+        _playlists = [];
+        _sections = [];
+      }
+
+      // 静默刷新时有内容可看，就不转圈
+      _loading = !silent && cached == null;
+    });
+
+    if (cached != null) {
+      _apply(cached);
     }
 
     try {
@@ -235,7 +448,15 @@ class _UserProfilePageState extends State<UserProfilePage>
 
       setState(() {
         _loading = false;
-        _error = '加载失败：$e';
+
+        // 屏幕上已经有内容（缓存或刷新的旧数据）时不要把整页换成错误页
+        final hasContent = _videos.isNotEmpty ||
+            _playlists.isNotEmpty ||
+            _sections.isNotEmpty;
+
+        if (!hasContent) {
+          _error = '加载失败：$e';
+        }
       });
     }
   }
@@ -290,6 +511,8 @@ class _UserProfilePageState extends State<UserProfilePage>
         builder: (_) => VideoDetailPage(videoId: id),
       ),
     );
+    // 不用在这里手动刷新：详情页改了储存状态会 DataRevision.bump()，
+    // 本页监听到就静默刷新了（见 _onDataChanged）。
   }
 
   void _openPlaylist(String url, String name) {
@@ -311,45 +534,71 @@ class _UserProfilePageState extends State<UserProfilePage>
     return Scaffold(
       appBar: AppBar(
         title: Text(_name.isEmpty ? '用户主页' : _name),
-        actions: [
-          IconButton(
-            tooltip: '刷新',
-            onPressed: () => _load(),
-            icon: const Icon(Icons.refresh),
-          ),
-          // 只有看自己的主页时才给登出入口
-          if (_isSelf)
-            IconButton(
-              tooltip: '退出登录',
-              onPressed: _logout,
-              icon: const Icon(Icons.logout),
-            ),
-          const SizedBox(width: 4),
-        ],
-        bottom: TabBar(
-          controller: _tabController,
-          isScrollable: true,
-          tabAlignment: TabAlignment.start,
-          onTap: (index) {
-            final key = _tabs[index].key;
+        // 这里**不**放 actions。
+        //
+        // 无边框窗口 + 自绘标题栏之后 AppBar 是顶到 y=0 的，
+        // 而窗口右上角那三个按钮（最小化/最大化/关闭）是浮在最上面的
+        // 实心控件、占着右上角 138x38：放在 actions 里的图标会被压住，
+        // 往左让开 138px 又会让图标孤零零悬在中间。
+        // 所以刷新/退出挪到了下面标签页那一行的右端 ——
+        // 那里本来就空着（标签页是从左边排的），而且已经避开了窗口按钮。
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(_tabRowHeight),
+          child: SizedBox(
+            height: _tabRowHeight,
+            child: Row(
+              children: [
+                Expanded(
+                  child: TabBar(
+                    controller: _tabController,
+                    isScrollable: true,
+                    tabAlignment: TabAlignment.start,
+                    onTap: (index) {
+                      final key = _tabs[index].key;
 
-            if (key != _tab) _load(tab: key);
-          },
-          tabs: [
-            for (final t in _tabs)
-              Tab(
-                icon: Icon(t.icon, size: 18),
-                text: t.label,
-                height: 52,
-              ),
-          ],
+                      if (key != _tab) _load(tab: key);
+                    },
+                    tabs: [
+                      for (final t in _tabs)
+                        Tab(
+                          icon: Icon(t.icon, size: 18),
+                          text: t.label,
+                          height: 52,
+                        ),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  tooltip: '刷新',
+                  onPressed: () => _load(),
+                  icon: const Icon(Icons.refresh),
+                ),
+                // 只有看自己的主页时才给登出入口
+                if (_isSelf)
+                  IconButton(
+                    tooltip: '退出登录',
+                    onPressed: _logout,
+                    icon: const Icon(Icons.logout),
+                  ),
+                const SizedBox(width: 8),
+              ],
+            ),
+          ),
         ),
       ),
       body: _buildBody(theme),
     );
   }
 
+  /// 标签页那一行的高度（TabBar 的 52 + 底下 2px 指示条）
+  static const double _tabRowHeight = 54;
+
   Widget _buildBody(ThemeData theme) {
+    // 未登录：显示登录引导，而不是空的 tab 页
+    if (!AuthController.isLoggedIn) {
+      return _buildLoggedOut(theme);
+    }
+
     if (_loading) {
       return const Center(child: Windows11Loading(size: 48));
     }
@@ -357,7 +606,6 @@ class _UserProfilePageState extends State<UserProfilePage>
     return Column(
       children: [
         _buildHeader(theme),
-        const Divider(height: 1),
         Expanded(
           child: _error != null
               ? _buildError()
@@ -417,14 +665,14 @@ class _UserProfilePageState extends State<UserProfilePage>
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  _name.isEmpty ? '用户 ${widget.userId}' : _name,
+                  _name.isEmpty ? '用户 $_effectiveUserId' : _name,
                   style: theme.textTheme.titleLarge?.copyWith(
                     fontWeight: FontWeight.bold,
                   ),
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'ID ${widget.userId}',
+                  'ID $_effectiveUserId',
                   style: TextStyle(
                     fontSize: 12,
                     color: theme.colorScheme.onSurface
@@ -433,11 +681,6 @@ class _UserProfilePageState extends State<UserProfilePage>
                 ),
               ],
             ),
-          ),
-          IconButton(
-            tooltip: '刷新',
-            onPressed: () => _load(),
-            icon: const Icon(Icons.refresh),
           ),
         ],
       ),
@@ -479,49 +722,20 @@ class _UserProfilePageState extends State<UserProfilePage>
   }
 
   /// 给列表内容套上分页条（每页 60 条，历史记录有 30 页，不翻页看不完）。
+  ///
+  /// 用统一的 PagerBar，和观看记录 / 播放清单的外观一致。
   Widget _buildPaged(Widget content) {
     if (_totalPages <= 1) return content;
-
-    final theme = Theme.of(context);
 
     return Column(
       children: [
         Expanded(child: content),
         const Divider(height: 1),
-        Padding(
-          padding: const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 8,
-          ),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              IconButton(
-                tooltip: '上一页',
-                onPressed: (_page > 1 && !_loading)
-                    ? () => _load(page: _page - 1)
-                    : null,
-                icon: const Icon(Icons.chevron_left),
-              ),
-              const SizedBox(width: 8),
-              Text(
-                '第 $_page / $_totalPages 页',
-                style: TextStyle(
-                  fontSize: 13,
-                  color: theme.colorScheme.onSurface
-                      .withValues(alpha: 0.7),
-                ),
-              ),
-              const SizedBox(width: 8),
-              IconButton(
-                tooltip: '下一页',
-                onPressed: (_page < _totalPages && !_loading)
-                    ? () => _load(page: _page + 1)
-                    : null,
-                icon: const Icon(Icons.chevron_right),
-              ),
-            ],
-          ),
+        PagerBar(
+          page: _page,
+          totalPages: _totalPages,
+          loading: _loading,
+          onGoToPage: (target) => _load(page: target),
         ),
       ],
     );
@@ -590,58 +804,12 @@ class _UserProfilePageState extends State<UserProfilePage>
               ),
             ),
 
-            // 横向卡片行
-            SizedBox(
-              height: 232,
-              child: ListView.separated(
-                scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                itemCount: kind == 'playlists'
-                    ? playlists.length
-                    : videos.length,
-                separatorBuilder: (_, _) => const SizedBox(width: 12),
-                itemBuilder: (context, i) {
-                  if (kind == 'playlists') {
-                    final pl = playlists[i];
-
-                    return SizedBox(
-                      width: 172,
-                      child: _ProfileCard(
-                        title: pl['name']?.toString() ?? '',
-                        thumbnail:
-                            pl['thumbnail']?.toString() ?? '',
-                        subtitle:
-                            pl['video_count']?.toString() ?? '',
-                        icon: Icons.playlist_play,
-                        onTap: () {
-                          final id = pl['list_id']?.toString();
-
-                          if (id == null || id.isEmpty) return;
-
-                          _openPlaylistId(
-                            id,
-                            pl['name']?.toString() ?? '',
-                          );
-                        },
-                      ),
-                    );
-                  }
-
-                  final v = videos[i];
-
-                  return SizedBox(
-                    width: 172,
-                    child: _ProfileCard(
-                      title: v['title']?.toString() ?? '',
-                      thumbnail: v['thumbnail']?.toString() ?? '',
-                      subtitle: v['duration']?.toString() ?? '',
-                      trailing: v['views']?.toString() ?? '',
-                      onTap: () =>
-                          _openVideo(v['url']?.toString() ?? ''),
-                    ),
-                  );
-                },
-              ),
+            // 响应式网格（和 APP 首页栏目段一致）
+            _SectionsGridView(
+              videos: kind == 'playlists' ? playlists : videos,
+              isPlaylist: kind == 'playlists',
+              onOpenVideo: (url) => _openVideo(url),
+              onOpenPlaylist: _openPlaylistId,
             ),
           ],
         );
@@ -700,17 +868,46 @@ class _UserProfilePageState extends State<UserProfilePage>
     );
   }
 
+  /// 个人主页的网格统一用首页那套尺寸（见 widgets/video_card.dart）。
+  ///
+  /// 以前这里用的是 maxCrossAxisExtent: 240 + childAspectRatio: 0.95，
+  /// 和首页的「按宽度分列 + 固定文字区高度」不是一套算法，
+  /// 于是同一个视频在首页和个人主页里卡片大小对不上。
+  Widget _cardGrid({
+    required int count,
+    required Widget Function(BuildContext context, int index) itemBuilder,
+    EdgeInsets padding = const EdgeInsets.all(24),
+    bool shrinkWrap = false,
+  }) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final metrics = videoCardMetrics(
+          maxWidth: constraints.maxWidth,
+          horizontalPadding: padding.left + padding.right,
+        );
+
+        return GridView.builder(
+          shrinkWrap: shrinkWrap,
+          physics: shrinkWrap
+              ? const NeverScrollableScrollPhysics()
+              : null,
+          padding: padding,
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: metrics.columns,
+            crossAxisSpacing: 16,
+            mainAxisSpacing: 16,
+            mainAxisExtent: metrics.itemHeight,
+          ),
+          itemCount: count,
+          itemBuilder: itemBuilder,
+        );
+      },
+    );
+  }
+
   Widget _buildVideoGrid(ThemeData theme) {
-    return GridView.builder(
-      padding: const EdgeInsets.all(20),
-      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-        maxCrossAxisExtent: 240,
-        crossAxisSpacing: 14,
-        mainAxisSpacing: 14,
-        // 缩略图 16:9 + 标题两行 + 一条信息，约这个比例刚好不留白
-        childAspectRatio: 0.95,
-      ),
-      itemCount: _videos.length,
+    return _cardGrid(
+      count: _videos.length,
       itemBuilder: (context, index) {
         return _ProfileCard(
           title: _videos[index]['title']?.toString() ?? '',
@@ -725,15 +922,8 @@ class _UserProfilePageState extends State<UserProfilePage>
   }
 
   Widget _buildPlaylistGrid(ThemeData theme) {
-    return GridView.builder(
-      padding: const EdgeInsets.all(20),
-      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-        maxCrossAxisExtent: 240,
-        crossAxisSpacing: 14,
-        mainAxisSpacing: 14,
-        childAspectRatio: 0.95,
-      ),
-      itemCount: _playlists.length,
+    return _cardGrid(
+      count: _playlists.length,
       itemBuilder: (context, index) {
         final count = _playlists[index]['video_count']?.toString() ?? '';
 
@@ -922,6 +1112,81 @@ class _ProfileCardState extends State<_ProfileCard> {
           ),
         ),
       ),
+    );
+  }
+}
+
+/// 个人主页栏目段的响应式网格。
+///
+/// 列数和卡片宽度随窗口宽度变化，和 APP 首页的栏目段一致
+/// （用户要求去掉横向滑块，改回网格）。
+class _SectionsGridView extends StatelessWidget {
+  final List<Map<String, dynamic>> videos;
+  final bool isPlaylist;
+  final void Function(String url) onOpenVideo;
+  final void Function(String listId, String name) onOpenPlaylist;
+
+  const _SectionsGridView({
+    required this.videos,
+    required this.isPlaylist,
+    required this.onOpenVideo,
+    required this.onOpenPlaylist,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (videos.isEmpty) return const SizedBox.shrink();
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // 尺寸和首页统一（见 widgets/video_card.dart）
+        final metrics = videoCardMetrics(
+          maxWidth: constraints.maxWidth,
+          horizontalPadding: 48,
+        );
+
+        return GridView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          padding: const EdgeInsets.fromLTRB(24, 4, 24, 16),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: metrics.columns,
+            crossAxisSpacing: 16,
+            mainAxisSpacing: 16,
+            mainAxisExtent: metrics.itemHeight,
+          ),
+          itemCount: videos.length,
+          itemBuilder: (context, i) {
+            if (isPlaylist) {
+              final pl = videos[i];
+
+              return _ProfileCard(
+                title: pl['name']?.toString() ?? '',
+                thumbnail: pl['thumbnail']?.toString() ?? '',
+                subtitle: pl['video_count']?.toString() ?? '',
+                icon: Icons.playlist_play,
+                onTap: () {
+                  final id = pl['list_id']?.toString();
+
+                  if (id == null || id.isEmpty) return;
+
+                  onOpenPlaylist(id, pl['name']?.toString() ?? '');
+                },
+              );
+            }
+
+            final v = videos[i];
+
+            return _ProfileCard(
+              title: v['title']?.toString() ?? '',
+              thumbnail: v['thumbnail']?.toString() ?? '',
+              subtitle: v['duration']?.toString() ?? '',
+              trailing: v['views']?.toString() ?? '',
+              onTap: () => onOpenVideo(v['url']?.toString() ?? ''),
+            );
+          },
+        );
+      },
     );
   }
 }

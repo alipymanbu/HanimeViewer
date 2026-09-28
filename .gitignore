@@ -62,3 +62,12 @@ desktop.ini
 # ---------- 本地临时文件 ----------
 *.log
 tmp/
+
+# ---------- 应用数据 ----------
+# 默认的数据目录就在程序根目录下（settings.json / downloads.json / Downloads）。
+# 里面是个人设置和下载的影片，绝对不要提交。
+HanimeData/
+
+# MSIX 自签名证书：.pfx 里有私钥，不进版本库（.cer 可以发给人）
+frontend/msix_cert/*.pfx
+frontend/msix_cert/*.cer

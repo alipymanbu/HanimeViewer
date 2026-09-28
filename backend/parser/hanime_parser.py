@@ -1,3 +1,5 @@
+import re
+
 from bs4 import BeautifulSoup
 
 from parser.models import VideoCard, VideoDetail
@@ -729,6 +731,134 @@ class HanimeParser:
 
         return result
 
+    def get_interaction_state(self):
+        """当前账号对这部影片的互动状态 —— 直接读 HTML，不用再导航。
+
+        判据（实测，都在详情页 HTML 里）：
+
+        1. 点赞：
+           <input name="like-status" type="hidden" value="1">   -> 已点赞
+           <input name="unlike-status" type="hidden" value="1"> -> 已点踩
+           （未登录 / 未点赞时这些值为空）
+
+        2. 储存：
+           <form id="video-save-form">
+             <input id="save" class="playlist-checkbox" type="checkbox" checked>
+             带 checked 属性的 checkbox 就是已储存的清单。
+
+        3. 可选的播放清单：同一个 form 里的所有 checkbox 就是账号的清单列表。
+
+        之前为了拿这些状态，专门调了一次 /api/video/{id}/state，
+        它要重新导航页面 + 打开储存弹窗（约 2.8 秒）。其实页面 HTML
+        里就带着，白跑了一趟。这里直接解析，免费。
+
+        储存弹窗需要的「可选清单」也一并解析出来，
+        这样客户端点「储存」能立刻弹窗，不用再等一次浏览器导航。
+        """
+        state = {
+            "liked": False,
+            "disliked": False,
+            "saved": False,
+            "saved_playlist": "",
+            "save_playlists": [],
+        }
+
+        like_status = self.soup.find(
+            "input", attrs={"name": "like-status"}
+        )
+
+        if like_status and (like_status.get("value") or "") == "1":
+            state["liked"] = True
+
+        unlike_status = self.soup.find(
+            "input", attrs={"name": "unlike-status"}
+        )
+
+        if unlike_status and (unlike_status.get("value") or "") == "1":
+            state["disliked"] = True
+
+        # 储存 + 可选清单：都在 #video-save-form 里
+        form = self.soup.find("form", attrs={"id": "video-save-form"})
+
+        if form:
+            playlists = []
+
+            for checkbox in form.find_all(
+                "input", class_="playlist-checkbox"
+            ):
+                label = checkbox.find_parent("label")
+                name = (
+                    label.get_text(strip=True)
+                    if label
+                    else (checkbox.get("id") or "")
+                )
+
+                if not name:
+                    continue
+
+                checked = checkbox.has_attr("checked")
+
+                playlists.append({
+                    "list_id": checkbox.get("id") or "",
+                    "name": name,
+                    "checked": checked,
+                })
+
+                if checked and not state["saved"]:
+                    state["saved"] = True
+                    state["saved_playlist"] = name
+
+            state["save_playlists"] = playlists
+
+        return state
+
+    def get_playlist_bookmark_state(self):
+        """播放清单详情页右上角书签的**收藏状态**。
+
+        官网结构（实测）：
+
+            <form id="playlist-show-add-form" method="POST"
+                  action="https://hanime1.me/addPlaylist">
+              <input type="hidden" name="_token" ...>
+              <input type="hidden" name="playlist-reference-id" value="976998">
+              <button type="submit" class="btn-icon-action no-select">
+                <span id="playlist-bookmark-icon"
+                      class="material-symbols-outlined"
+                      style="font-variation-settings: 'FILL' 1;">bookmark</span>
+              </button>
+            </form>
+
+        判据：`#playlist-bookmark-icon` 的 style 里带 `'FILL' 1`
+        -> 实心书签 -> 已收藏；否则空心 -> 未收藏。
+
+        注意：**自己的播放清单页面上没有这个书签表单**
+        （自己的清单没什么可收藏的），这时 can_bookmark=False，
+        客户端就不该显示可点的书签。
+        """
+        form = self.soup.find(
+            "form", attrs={"id": "playlist-show-add-form"}
+        )
+
+        if not form:
+            return {"can_bookmark": False, "bookmarked": False}
+
+        icon = self.soup.find(
+            "span", attrs={"id": "playlist-bookmark-icon"}
+        )
+
+        if not icon:
+            return {"can_bookmark": False, "bookmarked": False}
+
+        style = icon.get("style") or ""
+
+        # 'FILL' 1 / 'FILL'1 / "FILL" 1 ... 都算实心
+        normalized = style.replace('"', "'").replace(" ", "")
+
+        return {
+            "can_bookmark": True,
+            "bookmarked": "'FILL'1" in normalized,
+        }
+
     def get_related_videos(self, limit=None):
         # 相關影片区：
         # <div id="related-tabcontent">
@@ -837,7 +967,6 @@ class HanimeParser:
                 "url": href,
                 "thumbnail": thumbnail or ""
             })
-
             if limit is not None and len(result) >= limit:
                 break
 
@@ -1132,14 +1261,45 @@ class HanimeParser:
 
         return result
 
+    def _page_user_id(self):
+        """从当前页面判断「这个主页是谁的」。"""
+        # canonical 最可靠：<link rel="canonical" href=".../user/367299">
+        link = self.soup.find("link", attrs={"rel": "canonical"})
+
+        if link:
+            href = self.clean_url(link.get("href")) or ""
+
+            match = re.search(r"/user/(\d+)", href)
+
+            if match:
+                return match.group(1)
+
+        # 再看 og:url
+        og = self.soup.find("meta", attrs={"property": "og:url"})
+
+        if og:
+            href = og.get("content") or ""
+
+            match = re.search(r"/user/(\d+)", href)
+
+            if match:
+                return match.group(1)
+
+        return ""
+
     def get_user_avatar(self):
         """用户/发行商主页上的头像。
 
-        页面上有多张 avatar/icon 图（导航 logo、默认头像等），
-        这里挑真正的用户头像：src 里带 /image/avatar/ 的那张，
-        并且排除默认头像 user_default_image。
+        坑：页面上不止一张 `/image/avatar/` 图 —— 登录状态下
+        **导航栏里还有当前登录用户的头像**，而它排在前面。
+        之前直接取第一张，结果访问任何人的主页都显示成自己的头像。
+
+        现在改成跟「这个主页是谁的」对齐：头像文件名是
+        `{userId}-xxxx.jpeg`，用页面自己的 user id 去匹配。
         """
-        best = ""
+        page_user_id = self._page_user_id()
+
+        candidates = []
 
         for img in self.soup.find_all("img"):
             src = self.clean_url(img.get("src")) or ""
@@ -1150,20 +1310,28 @@ class HanimeParser:
             if "user_default_image" in src:
                 continue
 
-            best = src
-            break
+            candidates.append(src)
 
-        if best:
-            return best
+        if not candidates:
+            return ""
 
-        # 退而求其次：页面里带 avatar 字样的第一张
-        for img in self.soup.find_all("img"):
-            src = self.clean_url(img.get("src")) or ""
+        # 1. 优先挑文件名里带这个主页 id 的那张
+        if page_user_id:
+            for src in candidates:
+                if f"/{page_user_id}-" in src or f"/{page_user_id}." in src:
+                    return src
 
-            if "avatar" in src and "user_default_image" not in src:
-                return src
+            # 知道主页是谁，但页面里没有这个人的头像。
+            #
+            # 这种账号（没设过头像）页面上剩下的 avatar 图全是
+            # **当前登录用户**的（导航栏那几张），实测 uid=367298 就是
+            # 4 张全是 715321 的头像。
+            # 这时必须返回空，让客户端显示默认头像 ——
+            # 绝不能退回「第一张」，否则又是拿自己的头像冒充别人。
+            return ""
 
-        return ""
+        # 2. 判断不出主页 id 时才退回第一张（老行为）
+        return candidates[0]
 
     def get_video_detail(self):
         title = self.get_title()

@@ -14,6 +14,9 @@ import 'app_config.dart';
 ///
 /// 后端自己负责把调试 Chrome 拉起来（见 backend/browser.py），
 /// 所以这里只需要管后端进程。
+/// 后端启动结果：(是否成功, 是不是外部已经在跑, 失败原因)
+typedef BackendStart = (bool ok, bool alreadyRunning, String error);
+
 class BackendLauncher {
   BackendLauncher._();
 
@@ -90,6 +93,18 @@ class BackendLauncher {
   /// 启动后端。返回 (成功, 错误信息)。
   ///
   /// 如果后端已经在跑，会直接复用，不会重复启动。
+  /// 和 [start] 一样，但顺带算出「是不是外部已经在跑」。
+  ///
+  /// **返回 Future 而不是 await 完再返回**：调用方（`main()`）拿到 Future
+  /// 就往下走、先把界面推出来，等它的活儿交给启动页。
+  /// 冷启动时 [start] 要 2100ms 左右（`isBackendAlive()` 探测端口的超时），
+  /// 挡在首帧前面的话窗口要 2 秒之后才出现。
+  static Future<BackendStart> startWithStatus() async {
+    final (ok, error) = await start();
+
+    return (ok, ok && !startedByUs, error);
+  }
+
   static Future<(bool, String)> start() async {
     if (await isBackendAlive()) {
       _startedByUs = false;
@@ -223,10 +238,20 @@ class BackendLauncher {
 
   /// 退出时收尾：只结束我们自己启动的后端。
   ///
-  /// 顺序很重要：
-  /// 1. 先请求后端 /api/shutdown —— 让它把关掉的「隐藏调试浏览器」也收掉
-  ///    （那个浏览器窗口是隐藏的，用户看不到也没法自己关）
-  /// 2. 再结束后端进程树
+  /// **发完关闭请求就返回，不等浏览器收尾。**
+  ///
+  /// 后端是独立进程：它收到 `/api/shutdown` 后会自己起一个后台线程，
+  /// 先把隐藏的调试浏览器收掉、再 `os._exit(0)` —— 这跟我们还在不在
+  /// 完全无关。所以没必要在这儿干等。
+  ///
+  /// 以前这里会轮询 `/api/status` 等 `cdp_alive` 变 false（最多 20 秒），
+  /// 等完再 `taskkill /T /F`。两个问题：
+  ///   1. 开了 preventClose 之后这段时间窗口就卡着不动（用户反馈 4~5 秒）；
+  ///   2. `taskkill /T /F` 会**打断**后端正在做的收尾，
+  ///      反而留下 13 个隐藏的 chrome.exe（当初就是为了这个才加的等待）。
+  ///
+  /// 现在：请求发出去就结束。只有请求**没发出去**（后端已经卡死或没了）
+  /// 才退回强杀。
   static Future<void> stop() async {
     if (!_startedByUs) return;
 
@@ -237,7 +262,8 @@ class BackendLauncher {
 
     if (process == null) return;
 
-    // 1. 让后端顺便收掉隐藏的浏览器
+    var requestSent = false;
+
     try {
       final client = HttpClient()
         ..connectionTimeout = const Duration(seconds: 3);
@@ -250,48 +276,21 @@ class BackendLauncher {
 
       await response.drain<void>();
 
-      // 等后端把浏览器收干净。
-      //
-      // 后端内部是「轮询等 chrome 进程真正消失」，可能要好几秒。
-      // 之前这里只等 1.2 秒就把后端进程树杀了，
-      // 结果收尾被打断，留下 13 个隐藏的 chrome.exe。
-      //
-      // 所以这里改成轮询后端状态：等 cdp_alive 变成 false 再走，
-      // 最多等 20 秒，避免固定 sleep 要么太短要么白等。
-      final deadline = DateTime.now().add(const Duration(seconds: 20));
-
-      while (DateTime.now().isBefore(deadline)) {
-        try {
-          final statusRequest = await client.getUrl(
-            Uri.parse('${AppConfig.backendBase}/api/status'),
-          );
-
-          final statusResponse = await statusRequest.close();
-
-          final body =
-              await statusResponse.transform(utf8.decoder).join();
-
-          final data = jsonDecode(body);
-
-          if (data is Map && data['cdp_alive'] != true) {
-            // 浏览器已经没了
-            break;
-          }
-        } catch (_) {
-          // 后端可能已经自己退出了（说明收尾完成），也可以走了
-          break;
-        }
-
-        await Future<void>.delayed(const Duration(milliseconds: 500));
-      }
-
       client.close();
+
+      requestSent = response.statusCode == 200;
     } catch (_) {
-      // 后端可能已经没了，继续走结束进程
+      // 后端可能已经自己退了，也可能卡住了 —— 下面按情况处理
     }
 
-    // 2. 结束后端进程树
-    //    只杀外层是不够的：PyInstaller onefile 是「引导进程 + 应用进程」两层。
+    if (requestSent) {
+      // 后端答应了，剩下的交给它自己。这里**不能**再 taskkill，
+      // 那会把正在收尾的进程打断，浏览器就留在后台了。
+      return;
+    }
+
+    // 请求都没发成功：后端多半已经不动了，只好强杀进程树。
+    // 只杀外层是不够的：PyInstaller onefile 是「引导进程 + 应用进程」两层。
     try {
       if (Platform.isWindows) {
         await Process.run(

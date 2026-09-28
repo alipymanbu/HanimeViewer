@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import 'controllers/app_config.dart';
 import 'controllers/backend_launcher.dart';
+import 'widgets/hanime_logo.dart';
 
 /// 启动页：负责把「后端 + 调试浏览器」等起来。
 ///
@@ -12,11 +13,13 @@ import 'controllers/backend_launcher.dart';
 /// 现在 App 自己拉起后端，后端再自己拉起调试浏览器，
 /// 这个页面负责显示进度并在就绪后进入主界面。
 class StartupGate extends StatefulWidget {
-  /// 后端进程是否已由外部启动好（我们只负责等待）
-  final bool backendAlreadyRunning;
-
-  /// 启动后端时就失败了的错误（如果有，直接显示，不用再等超时）
-  final String initialError;
+  /// 启动后端的 Future（`BackendLauncher.startWithStatus()` 的结果）。
+  ///
+  /// 收 Future 而不是已经算好的值：后端冷启动要 2 秒左右，
+  /// 在 `main()` 里等它算完的话首帧就得等到 2 秒之后 ——
+  /// 窗口会一直不出现。所以界面先出来（本页就是加载页），
+  /// 在这里再等这个 Future。
+  final Future<BackendStart>? backendStart;
 
   /// 就绪后要展示的页面
   final Widget child;
@@ -24,8 +27,7 @@ class StartupGate extends StatefulWidget {
   const StartupGate({
     super.key,
     required this.child,
-    this.backendAlreadyRunning = false,
-    this.initialError = '',
+    this.backendStart,
   });
 
   @override
@@ -36,20 +38,14 @@ enum _Phase { connecting, startingBrowser, ready, failed }
 
 class _StartupGateState extends State<StartupGate> {
   _Phase _phase = _Phase.connecting;
-  String _detail = '正在连接后端…';
   String _error = '';
+
+  /// 后端本来就在跑（我们只负责等）—— 只用来选错误提示的措辞
+  bool _alreadyRunning = false;
 
   @override
   void initState() {
     super.initState();
-
-    if (widget.initialError.isNotEmpty) {
-      // 启动后端这一步就失败了，没必要再去等超时
-      _phase = _Phase.failed;
-      _error = widget.initialError;
-      return;
-    }
-
     _boot();
   }
 
@@ -94,7 +90,6 @@ class _StartupGateState extends State<StartupGate> {
 
       // 后端起来了但浏览器还没就绪：让后端把它拉起来
       _phase = _Phase.startingBrowser;
-      _detail = '正在启动调试浏览器…';
 
       await _requestBrowserStart(client);
     } finally {
@@ -117,6 +112,26 @@ class _StartupGateState extends State<StartupGate> {
   }
 
   Future<void> _boot() async {
+    // 0. 先等「启动后端」这一步出结果
+    //    （main() 里只是把 Future 递过来，没等它）
+    if (widget.backendStart != null) {
+      final (ok, alreadyRunning, error) = await widget.backendStart!;
+
+      if (!mounted) return;
+
+      _alreadyRunning = alreadyRunning;
+
+      if (!ok) {
+        // 启动后端这一步就失败了，没必要再去等超时
+        setState(() {
+          _phase = _Phase.failed;
+          _error = error;
+        });
+
+        return;
+      }
+    }
+
     // 1. 等后端起来（可能已经在跑，也可能是刚启动的）
     final ready = await _waitBackend();
 
@@ -127,7 +142,7 @@ class _StartupGateState extends State<StartupGate> {
 
       setState(() {
         _phase = _Phase.failed;
-        _error = widget.backendAlreadyRunning
+        _error = _alreadyRunning
             ? '连接后端超时。\n请确认后端已在 ${AppConfig.backendBase} 运行。'
             : '后端启动超时。\n\n'
                 '程序位置：${Platform.resolvedExecutable}\n'
@@ -146,8 +161,8 @@ class _StartupGateState extends State<StartupGate> {
 
       try {
         await _pollStatus();
-      } catch (e) {
-        _detail = '等待后端响应…';
+      } catch (_) {
+        // 后端还没起来时会连不上，忽略，下一轮继续等
       }
 
       if (_phase == _Phase.ready) {
@@ -200,7 +215,6 @@ class _StartupGateState extends State<StartupGate> {
 
       if (!mounted) return false;
 
-      _detail = '正在启动后端…';
 
       await Future<void>.delayed(const Duration(milliseconds: 500));
     }
@@ -225,12 +239,8 @@ class _StartupGateState extends State<StartupGate> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(
-                  Icons.video_library,
-                  size: 56,
-                  color: theme.colorScheme.primary,
-                ),
-                const SizedBox(height: 20),
+                const HanimeLogo(height: 80),
+                const SizedBox(height: 28),
                 const Text(
                   'HanimeViewer',
                   style: TextStyle(
@@ -238,8 +248,11 @@ class _StartupGateState extends State<StartupGate> {
                     fontWeight: FontWeight.bold,
                   ),
                 ),
-                const SizedBox(height: 28),
+
+                // 启动中：不放加载动画，也不放"正在启动后端…"那行字 ——
+                // 用户要求去掉，界面上只留图标和名字。
                 if (_phase == _Phase.failed) ...[
+                  const SizedBox(height: 28),
                   Icon(
                     Icons.error_outline,
                     size: 40,
@@ -260,28 +273,12 @@ class _StartupGateState extends State<StartupGate> {
                       setState(() {
                         _phase = _Phase.connecting;
                         _error = '';
-                        _detail = '正在重试…';
                       });
 
                       _boot();
                     },
                     icon: const Icon(Icons.refresh),
                     label: const Text('重试'),
-                  ),
-                ] else ...[
-                  const SizedBox(
-                    width: 28,
-                    height: 28,
-                    child: CircularProgressIndicator(strokeWidth: 2.5),
-                  ),
-                  const SizedBox(height: 20),
-                  Text(
-                    _detail,
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      color: theme.colorScheme.onSurface
-                          .withValues(alpha: 0.7),
-                    ),
                   ),
                 ],
               ],

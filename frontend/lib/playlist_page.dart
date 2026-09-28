@@ -6,6 +6,10 @@ import 'package:http/http.dart' as http;
 import 'playlist_detail_page.dart';
 import 'widgets/windows11_loading.dart';
 import 'controllers/app_config.dart';
+import './widgets/app_toast.dart';
+import 'widgets/pager_bar.dart';
+import 'controllers/data_revision.dart';
+import 'widgets/video_card.dart';
 
 class PlaylistPage extends StatefulWidget {
   const PlaylistPage({super.key});
@@ -35,10 +39,29 @@ class _PlaylistPageState extends State<PlaylistPage> {
   @override
   void initState() {
     super.initState();
+
+    // 别处改了数据（储存/取消储存/新建清单）时静默刷新
+    DataRevision.revision.addListener(_onDataChanged);
+
     _loadPlaylists();
   }
 
-  Future<void> _loadPlaylists({int? page}) async {
+  @override
+  void dispose() {
+    DataRevision.revision.removeListener(_onDataChanged);
+    super.dispose();
+  }
+
+  /// 全局数据变了：静默刷新清单列表（影片数会变）
+  void _onDataChanged() {
+    if (!mounted) return;
+
+    _loadPlaylists(page: _page, silent: true);
+  }
+
+  /// [silent] 为 true 时保留当前列表、不显示加载转圈，
+  /// 后台取到新数据后原地替换（用在"从详情页返回"这类场景）。
+  Future<void> _loadPlaylists({int? page, bool silent = false}) async {
     final targetPage = page ?? _page;
 
     if (targetPage < 1 || targetPage > _totalPages) {
@@ -46,7 +69,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
     }
 
     setState(() {
-      _loading = true;
+      _loading = !silent;
       _error = null;
     });
 
@@ -110,50 +133,6 @@ class _PlaylistPageState extends State<PlaylistPage> {
     }
   }
 
-  void _previousPage() {
-    if (_page <= 1 || _loading) {
-      return;
-    }
-
-    _loadPlaylists(
-      page: _page - 1,
-    );
-  }
-
-  void _nextPage() {
-    if (_page >= _totalPages || _loading) {
-      return;
-    }
-
-    _loadPlaylists(
-      page: _page + 1,
-    );
-  }
-
-  Future<void> _showPageJumpDialog() async {
-    final page = await showDialog<int>(
-      context: context,
-      builder: (dialogContext) {
-        return _PageJumpDialog(
-          currentPage: _page,
-          totalPages: _totalPages,
-        );
-      },
-    );
-
-    if (!mounted) {
-      return;
-    }
-
-    if (page == null || page == _page) {
-      return;
-    }
-
-    await _loadPlaylists(
-      page: page,
-    );
-  }
-
   void _openPlaylist(
     Map<String, dynamic> playlist,
   ) {
@@ -190,26 +169,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
         },
       ),
     );
-  }
-
-  int _getCrossAxisCount(double width) {
-    if (width >= 1400) {
-      return 5;
-    }
-
-    if (width >= 1100) {
-      return 4;
-    }
-
-    if (width >= 800) {
-      return 3;
-    }
-
-    if (width >= 560) {
-      return 2;
-    }
-
-    return 1;
+    // 不用手动刷新：清单里的影片被改动时会 DataRevision.bump()
   }
 
   @override
@@ -260,21 +220,20 @@ class _PlaylistPageState extends State<PlaylistPage> {
                 context,
                 constraints,
               ) {
-                final crossAxisCount =
-                    _getCrossAxisCount(
-                  constraints.maxWidth,
+                // 尺寸和首页统一（见 widgets/video_card.dart）
+                final metrics = videoCardMetrics(
+                  maxWidth: constraints.maxWidth,
+                  horizontalPadding: 36,
                 );
 
                 return GridView.builder(
                   padding: const EdgeInsets.all(18),
                   gridDelegate:
                       SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount:
-                        crossAxisCount,
-                    crossAxisSpacing: 14,
-                    mainAxisSpacing: 14,
-                    // 缩略图 16:9 + 标题两行 + 一部影片数
-                    childAspectRatio: 0.95,
+                    crossAxisCount: metrics.columns,
+                    crossAxisSpacing: 16,
+                    mainAxisSpacing: 16,
+                    mainAxisExtent: metrics.itemHeight,
                   ),
                   itemCount: _playlists.length,
                   itemBuilder: (
@@ -318,76 +277,14 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
         // 只有真的存在多页时才显示分页条。
         // 没有播放清单（或只有一页）就不显示，「有多少页显示多少页」。
-        if (_loadedOnce && _totalPages > 1 && _playlists.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(
-              18,
-              6,
-              18,
-              14,
-            ),
-          child: Row(
-            mainAxisAlignment:
-                MainAxisAlignment.center,
-            children: [
-              OutlinedButton.icon(
-                onPressed:
-                    _page > 1 && !_loading
-                        ? _previousPage
-                        : null,
-                icon: const Icon(
-                  Icons.chevron_left,
-                ),
-                label: const Text('上一页'),
-              ),
-
-              const SizedBox(width: 16),
-
-              InkWell(
-                borderRadius:
-                    BorderRadius.circular(8),
-                onTap:
-                    _loading
-                        ? null
-                        : _showPageJumpDialog,
-                child: Padding(
-                  padding:
-                      const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 8,
-                  ),
-                  child: Text(
-                    '第 $_page / $_totalPages 页',
-                    style: TextStyle(
-                      fontWeight:
-                          FontWeight.w600,
-                      color:
-                          _loading
-                              ? Colors.grey
-                              : Theme.of(context)
-                                  .colorScheme
-                                  .primary,
-                    ),
-                  ),
-                ),
-              ),
-
-              const SizedBox(width: 16),
-
-              OutlinedButton.icon(
-                onPressed:
-                    _page < _totalPages &&
-                            !_loading
-                        ? _nextPage
-                        : null,
-                icon: const Icon(
-                  Icons.chevron_right,
-                ),
-                label: const Text('下一页'),
-              ),
-            ],
+        if (_loadedOnce && _playlists.isNotEmpty)
+          PagerBar(
+            page: _page,
+            totalPages: _totalPages,
+            loading: _loading,
+            padding: const EdgeInsets.fromLTRB(18, 6, 18, 14),
+            onGoToPage: (target) => _loadPlaylists(page: target),
           ),
-        ),
       ],
     );
   }
@@ -606,12 +503,9 @@ class _PageJumpDialogState
     if (page == null ||
         page < 1 ||
         page > widget.totalPages) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            '请输入 1~${widget.totalPages} 之间的页码',
-          ),
-        ),
+      AppToast.error(
+        context,
+        '请输入 1~${widget.totalPages} 之间的页码',
       );
       return;
     }

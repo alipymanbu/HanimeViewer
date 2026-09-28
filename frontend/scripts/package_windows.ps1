@@ -1,4 +1,4 @@
-# 生成可独立运行的 Windows 发布目录
+﻿# 生成可独立运行的 Windows 发布目录
 #
 # 用法（在项目根目录）：
 #   powershell -ExecutionPolicy Bypass -File frontend\scripts\package_windows.ps1
@@ -39,7 +39,20 @@ Write-Host "`n[2/3] 打包前端 (Flutter Windows release)..." -ForegroundColor 
 
 Push-Location $frontend
 try {
-  & flutter build windows --release
+  # --no-tree-shake-icons 是**故意的**，不要去掉。
+  #
+  # Flutter 默认会 tree-shake 图标字体（只保留代码里用到的图标，
+  # 字体从约 1.6MB 缩到几十 KB）。但它**不可靠**，实测踩过两次：
+  #
+  #   1. 增量构建时会复用**过期的**树摇结果 —— 新加的图标
+  #      （Icons.thumb_up / Icons.bookmark）根本不在字体里，
+  #      界面上渲染成**空白**，看起来像"图标丢了"。
+  #   2. 即使全量重建，它也会漏掉某些图标 —— 实测
+  #      Icons.arrow_drop_down 就没被收进去（筛选栏的下拉箭头变空白）。
+  #
+  # 这是桌面应用，整个图标字体也才 1.6MB（发布目录本来就 45MB），
+  # 为这点体积换"图标随时可能消失"的风险不划算。
+  & flutter build windows --release --no-tree-shake-icons
 
   if ($LASTEXITCODE -ne 0) {
     Write-Error "Flutter 打包失败"

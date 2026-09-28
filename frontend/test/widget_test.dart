@@ -21,7 +21,6 @@ import 'package:frontend/controllers/app_cache.dart';
 import 'package:frontend/controllers/auth_controller.dart';
 import 'package:frontend/controllers/theme_controller.dart';
 import 'package:frontend/main.dart';
-import 'package:frontend/new_release_page.dart';
 import 'package:frontend/startup_gate.dart';
 import 'package:frontend/utils/format.dart';
 import 'package:frontend/utils/user_tabs.dart';
@@ -98,17 +97,20 @@ void main() {
   });
 
   testWidgets('启动页在启动失败时显示错误和重试按钮', (WidgetTester tester) async {
-    // 注意：这里传 initialError，让启动页直接进入失败态。
+    // 注意：这里直接给一个「已经失败」的 Future，让启动页进入失败态。
     // 不测「等待就绪」那条路：它会起 45 秒轮询定时器，
     // 测试结束时定时器还挂着会直接判定失败（Pending timer）。
     await tester.pumpWidget(
-      const MaterialApp(
+      MaterialApp(
         home: StartupGate(
-          initialError: '测试用的启动失败原因',
-          child: SizedBox.shrink(),
+          backendStart: Future.value((false, false, '测试用的启动失败原因')),
+          child: const SizedBox.shrink(),
         ),
       ),
     );
+
+    // Future 是异步完成的，要 pump 两次：一次让它 resolve，一次重建
+    await tester.pump();
     await tester.pump();
 
     expect(tester.takeException(), isNull);
@@ -244,46 +246,7 @@ void main() {
     });
   });
 
-  group('缩略图尺寸', () {
-    testWidgets('列表卡片缩略图固定 16:9（不随卡片高度变化）',
-        (WidgetTester tester) async {
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: Center(
-              child: SizedBox(
-                width: 200,
-                child: VideoGridCard(
-                  title: '一段比较长的标题会换行两行来测试布局是否还被撑开',
-                  thumbnail: '',
-                  duration: '20:40',
-                  views: '188 万次',
-                  onTap: () {},
-                ),
-              ),
-            ),
-          ),
-        ),
-      );
-      await tester.pump();
-
-      // 缩略图用 AspectRatio(16/9) 约束，
-      // 这样高度只由宽度决定，不会因为标题一行/两行而变化。
-      final ratios = tester
-          .widgetList<AspectRatio>(find.byType(AspectRatio))
-          .map((a) => a.aspectRatio)
-          .toList();
-
-      expect(ratios, isNotEmpty, reason: '缩略图应该用 AspectRatio 约束');
-
-      expect(
-        ratios.any((r) => (r - 16 / 9).abs() < 0.01),
-        isTrue,
-        reason: '缩略图应该保持 16:9，实际比例：$ratios',
-      );
-    });
-  });
-
+  // 缩略图尺寸 / 相关影片比例 / 信息图标 的测试在 layout_test.dart
   group('账号数据隔离', () {
     tearDown(() {
       // 每个测试后恢复成未登录，避免影响别的用例

@@ -1,13 +1,15 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'playlist_page.dart';
+import 'downloads_page.dart';
 import 'widgets/windows11_loading.dart';
 import 'controllers/theme_controller.dart';
 import 'controllers/app_cache.dart';
 import 'controllers/auth_controller.dart';
+import 'controllers/saved_accounts.dart';
 import 'controllers/account_scope.dart';
 import 'controllers/backend_launcher.dart';
 import 'login_dialog.dart';
@@ -20,6 +22,18 @@ import 'package:video_player/video_player.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:window_manager/window_manager.dart';
 import 'controllers/app_config.dart';
+import 'controllers/data_revision.dart';
+import 'controllers/home_request.dart';
+import './widgets/app_toast.dart';
+import 'widgets/pager_bar.dart';
+import 'widgets/video_card.dart';
+import 'widgets/player_shortcuts.dart';
+import 'widgets/custom_title_bar.dart';
+import 'widgets/hanime_logo.dart';
+import 'widgets/window_resize_border.dart';
+import 'controllers/app_window.dart';
+import 'controllers/app_settings.dart';
+import 'widgets/save_playlist_dialog.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -31,53 +45,192 @@ void main() async {
 
   await ThemeController.load();
 
+  // 播放器 / 下载偏好（快捷键步长、倍速、上次音量、上次窗口大小）
+  await AppSettings.load();
+
+  // 恢复上次的窗口大小，并且**每次都居中**。
+  //
+  // 这里只做准备（尺寸 / 无边框 / 阴影），**不显示窗口** ——
+  // 显示推迟到第一帧画完之后，见下面 runApp 后面的 post-frame 回调。
+  await windowManager.waitUntilReadyToShow(
+    WindowOptions(
+      size: AppSettings.windowSize.value ?? AppSettings.defaultWindowSize,
+      center: true,
+      minimumSize: AppSettings.minimumWindowSize,
+      title: 'HanimeViewer',
+    ),
+    () async {
+      // 去掉系统标题栏，改用自绘的（见 widgets/custom_title_bar.dart）。
+      //
+      // 用 setAsFrameless() 而不是 TitleBarStyle.hidden：
+      // hidden 会通过 WM_NCCALCSIZE 在左/右/下各留 8px 非客户区边框，
+      // 那圈边框是窗口类背景色画的，深色主题下很明显。
+      await windowManager.setAsFrameless();
+
+      // 无边框之后系统不再画阴影，用 DWM 把边框重新延伸出来补上，
+      // 不然窗口和桌面糊在一起、看不出边界。
+      await windowManager.setHasShadow(true);
+    },
+  );
+
+  // 自绘标题栏要靠这些事件知道「现在是不是最大化 / 全屏」
+  windowManager.addListener(AppWindowListener());
+
   // 先读本地缓存的账号信息（立刻能显示头像），再异步向后端确认
   await AuthController.load();
-
-  // 自己把后端拉起来（后端再去把调试 Chrome 拉起来）。
-  // 如果后端已经在跑（比如开发时手动起的），会直接复用。
-  final (backendOk, backendError) = await BackendLauncher.start();
 
   // 关窗口时把后端一起收掉，否则端口会一直被占着。
   // 只收我们自己启动的那个：如果后端是外部起的就不动它。
   windowManager.addListener(_LifecycleCleaner());
 
-  runApp(
-    HanimeViewerApp(
-      backendStarted: backendOk,
-      backendAlreadyRunning: backendOk && !BackendLauncher.startedByUs,
-      backendError: backendError,
-    ),
-  );
+  // 关窗时先拦住，等 _LifecycleCleaner 把后端和设置处理完再真的关。
+  // 没有这一句的话，窗口一关进程就退，onWindowClose 里的异步收尾
+  // 会被直接掐断（清理就白做了）。
+  await windowManager.setPreventClose(true);
+
+  // 自己把后端拉起来（后端再去把调试 Chrome 拉起来）。
+  // 如果后端已经在跑（比如开发时手动起的），会直接复用。
+  //
+  // **拿到 Future 就走，不等它** —— 实测这一步冷启动要 2100ms
+  // （`isBackendAlive()` 探测端口有 2 秒超时），而前面所有初始化
+  // 加起来才 33ms。在这里 await 的话首帧要等到 2 秒之后，
+  // 窗口就一直不出现。等它的活儿交给启动页（StartupGate）。
+  final backendStart = BackendLauncher.startWithStatus();
+
+  runApp(HanimeViewerApp(backendStart: backendStart));
+
+  // 等**第一帧真的画完**再显示窗口。
+  //
+  // 以前是在 waitUntilReadyToShow 的回调里就 show()，那会儿 Flutter 还
+  // 什么都没画；而窗口类的背景刷是空的（win32_window.cpp 里
+  // `hbrBackground = 0`），所以露出来的是一块**全透明的窗口** ——
+  // 只有 DWM 阴影勾出个轮廓，用户看到的就是"一个能看见边框的透明窗口"，
+  // 过一会儿才变成界面（而且因为后端那 2 秒，这一眼要持续 5 秒多）。
+  // 放在首帧之后再显示就没这一眼了。
+  //
+  // 窗口一直隐藏着也会正常渲染（引擎照常出帧），所以这个回调一定会到。
+  WidgetsBinding.instance.addPostFrameCallback((_) async {
+    await windowManager.show();
+    await windowManager.focus();
+    await AppWindow.refresh();
+  });
 }
 
-/// 负责在 App 退出时清理我们启动的后端进程。
+/// 负责在 App 退出时清理我们启动的后端进程，并记下窗口大小。
 class _LifecycleCleaner with WindowListener {
+  Timer? _saveSizeTimer;
+
+  /// 拖动窗口边框时会连续触发（对应 WM_SIZING），防抖一下再写盘。
+  ///
+  /// 注意：**程序化的改尺寸不会触发这个事件**（比如 `setSize`
+  /// 或系统的 MoveWindow 都只发 WM_SIZE）。所以真正兜底的是
+  /// [_onWindowResized]（拖拽结束时那一次）。
+  @override
+  void onWindowResize() => _scheduleSaveSize();
+
+  /// 拖拽调整大小结束（WM_EXITSIZEMOVE）—— 用户拖完松手那一下。
+  @override
+  void onWindowResized() => _scheduleSaveSize();
+
+  void _scheduleSaveSize() {
+    _saveSizeTimer?.cancel();
+    _saveSizeTimer = Timer(const Duration(milliseconds: 400), _rememberSize);
+  }
+
+  /// 记住当前窗口大小。
+  ///
+  /// 最大化 / 全屏时不记 —— 那记下来的是"屏幕大小"，
+  /// 下次启动会以一个占满屏的窗口开始，不是用户想要的效果。
+  Future<void> _rememberSize() async {
+    try {
+      if (await windowManager.isMaximized()) return;
+      if (await windowManager.isFullScreen()) return;
+
+      final size = await windowManager.getSize();
+
+      await AppSettings.setWindowSize(size.width, size.height);
+    } catch (_) {
+      // 拿不到就算了，不该因为记窗口大小影响退出
+    }
+  }
+
+  /// 已经在走关闭流程了（防止重复收尾）
+  bool _closing = false;
+
   @override
   void onWindowClose() {
-    // 先同步关掉后端，再让窗口正常关闭
-    BackendLauncher.stop().whenComplete(() {
-      windowManager.destroy();
+    // 取消拦截后再 close() 会再收到一次 close 事件，这里挡掉
+    if (_closing) return;
+
+    _closing = true;
+
+    // 立刻把窗口藏起来。
+    //
+    // 用户点了关闭就该马上看到窗口消失。但后面还有收尾要做
+    // （写设置、请后端退出），而开着 preventClose 时窗口会一直
+    // 杵在屏幕上，看起来就是"点了关闭没反应，要等几秒"。
+    try {
+      windowManager.hide();
+    } catch (_) {}
+
+    _saveSizeTimer?.cancel();
+
+    // 关后端的请求必须**立刻**发出去。
+    //
+    // 窗口一旦关掉，进程随时会结束、Dart 隔离区跟着没。
+    // 之前把它挂在 _rememberSize().then(...) 后面，结果还没轮到它
+    // 进程就退了 —— 后端和 12 个隐藏 chrome 全留在后台（实测踩到）。
+    //
+    // 注意 stop() 现在只是"把请求发出去"就返回，不再等浏览器收尾
+    // （后端是独立进程，收到请求后会自己收干净），所以这里等它不费时间。
+    final stopping = BackendLauncher.stop();
+
+    // 记窗口大小和音量是"顺手做的事"，跟关后端并行跑
+    final saving = _rememberSize().then((_) => AppSettings.flushVolume());
+
+    void closeWindow() => unawaited(_finishClose());
+
+    // 两件都快（一个是本机 HTTP 往返、一个是几次本地写盘），
+    // 都完成了再关窗，保证设置一定落盘。
+    //
+    // 兜底定时器在正常路径上要**取消掉**：留着一个待触发的 Timer
+    // 会让 Dart 隔离区多活一会儿，进程也就退得慢。
+    final safety = Timer(const Duration(seconds: 2), closeWindow);
+
+    Future.wait<void>([stopping, saving]).whenComplete(() {
+      safety.cancel();
+      closeWindow();
     });
+  }
+
+  /// 收尾做完之后，真正把窗口关掉。
+  ///
+  /// 这里**不用 `destroy()`**：它只是往消息队列丢一个 WM_QUIT，
+  /// 窗口本身并没有被销毁，进程退出时还得额外拆一遍 ——
+  /// 实测从调用到进程真正消失要拖 4.7 秒（用户反馈"要等四五秒"）。
+  ///
+  /// 改成「先取消拦截、再走正常关窗」：窗口会被真正销毁，
+  /// 引擎收到 OnDestroy，进程很快就退了。
+  Future<void> _finishClose() async {
+    try {
+      await windowManager.setPreventClose(false);
+      await windowManager.close();
+    } catch (_) {
+      try {
+        windowManager.destroy();
+      } catch (_) {}
+    }
   }
 }
 
 class HanimeViewerApp extends StatelessWidget {
-  /// 后端是否已就绪（自己起的或外部已有的）
-  final bool backendStarted;
+  /// 启动后端的 Future —— 界面先出来，等它的活儿交给启动页。
+  ///
+  /// 不在这里算好再传：后端冷启动要 2 秒左右，算好再传的话首帧
+  /// 就得等 2 秒，窗口一直不出现（见 main() 里的注释）。
+  final Future<BackendStart>? backendStart;
 
-  /// 后端是否在启动前就已经在跑
-  final bool backendAlreadyRunning;
-
-  /// 启动后端失败时的原因
-  final String backendError;
-
-  const HanimeViewerApp({
-    super.key,
-    this.backendStarted = true,
-    this.backendAlreadyRunning = false,
-    this.backendError = '',
-  });
+  const HanimeViewerApp({super.key, this.backendStart});
 
   @override
   Widget build(BuildContext context) {
@@ -102,9 +255,44 @@ class HanimeViewerApp extends StatelessWidget {
             useMaterial3: true,
           ),
           themeMode: themeMode,
+
+          // 自绘标题栏放在 Navigator **外面**（MaterialApp.builder 包的就是
+          // Navigator）。放在 home 里的话，push 出来的页面（影片详情、
+          // 全屏播放器）会整个盖住它 —— 标题栏就没了。
+          //
+          // 它是一条**透明浮层**：底下的应用（含左侧侧边栏）直接透上来，
+          // 而且拖动区是 `translucent` 的（点得到下面的内容），
+          // 所以页面**不需要**为它让出顶部 —— 各页面就从 y=0 开始，
+          // 不会白白留一条 38px 的空白。
+          builder: (context, child) {
+            return ValueListenableBuilder<bool>(
+              valueListenable: AppWindow.fullscreen,
+              builder: (context, fullscreen, _) {
+                return WindowResizeBorder(
+                  child: Stack(
+                    children: [
+                      Positioned.fill(
+                        child: child ?? const SizedBox.shrink(),
+                      ),
+
+                      // 全屏看片时整条收起来
+                      if (!fullscreen)
+                        const Positioned(
+                          left: 0,
+                          right: 0,
+                          top: 0,
+                          height: AppWindow.titleBarHeight,
+                          child: CustomTitleBar(),
+                        ),
+                    ],
+                  ),
+                );
+              },
+            );
+          },
+
           home: StartupGate(
-            backendAlreadyRunning: backendAlreadyRunning,
-            initialError: backendError,
+            backendStart: backendStart,
             child: const MainShell(),
           ),
         );        
@@ -149,6 +337,34 @@ class _MainShellState extends State<MainShell> {
   /// 所以换账号时必须把已经建好的页面丢掉重建，
   /// 否则会一直显示上一个账号的数据。
   String _pagesScope = AccountScope.prefix;
+
+  @override
+  void initState() {
+    super.initState();
+
+    // 别的页面（影片详情页等）可以请求「回到首页」
+    HomeRequest.requests.addListener(_onHomeRequested);
+  }
+
+  @override
+  void dispose() {
+    HomeRequest.requests.removeListener(_onHomeRequested);
+
+    super.dispose();
+  }
+
+  /// 有页面请求回首页：把栏目切到「首页」。
+  ///
+  /// 不必在这层操心导航栈 —— 调用方会把 push 出来的页面关掉，
+  /// 露出主壳时它已经在首页了。
+  void _onHomeRequested() {
+    if (!mounted) return;
+
+    setState(() {
+      _section = _MainSection.home;
+      _searchPreset = null;
+    });
+  }
 
   /// 账号变了就清掉缓存页面（下次 build 会用新账号重建）。
   void _resetPagesIfAccountChanged() {
@@ -223,11 +439,7 @@ class _MainShellState extends State<MainShell> {
       case _MainSection.newRelease:
         return const NewReleasePage();
       case _MainSection.downloads:
-        return const _PlaceholderPage(
-          icon: Icons.download,
-          title: '下载',
-          message: '下载功能稍后实现。',
-        );
+        return const DownloadsPage();
       case _MainSection.settings:
         return const SettingsPage();        
     }
@@ -360,38 +572,48 @@ class _MainShellState extends State<MainShell> {
     // （否则在窄窗口下它会算出非法约束导致布局断言失败）。
     return SizedBox(
       width: 88,
-      child: Column(
+      child: Stack(
+        // expand：让下面的 Column 铺满整个侧边栏
+        fit: StackFit.expand,
         children: [
-          Expanded(
-            child: NavigationRail(
-              selectedIndex:
-                  _MainSection.values.indexOf(_section),
-              onDestinationSelected: (index) =>
-                  _select(_MainSection.values[index]),
-              labelType: NavigationRailLabelType.all,
-              leading: const Padding(
-                padding: EdgeInsets.only(bottom: 16),
-                child: Icon(
-                  Icons.video_library,
-                  size: 28,
+          Column(
+            children: [
+              // 顶部让出程序图标的位置：图标占 y 29..59，导航从它下面开始。
+              // （侧边栏是从窗口 y=0 开始的，这里就是窗口坐标）
+              SizedBox(height: SidebarLogo.reservedHeight),
+              Expanded(
+                child: NavigationRail(
+                  selectedIndex:
+                      _MainSection.values.indexOf(_section),
+                  onDestinationSelected: (index) =>
+                      _select(_MainSection.values[index]),
+                  labelType: NavigationRailLabelType.all,
+                  destinations: [
+                    for (final item in items)
+                      NavigationRailDestination(
+                        icon: Icon(item.$2),
+                        selectedIcon: Icon(item.$3),
+                        label: Text(item.$4),
+                      ),
+                  ],
                 ),
               ),
-              destinations: [
-                for (final item in items)
-                  NavigationRailDestination(
-                    icon: Icon(item.$2),
-                    selectedIcon: Icon(item.$3),
-                    label: Text(item.$4),
-                  ),
-              ],
-            ),
+              // 左下角的账号头像：未登录显示登录入口，登录后点进自己的主页
+              // （刻意不加分隔线，保持干净）
+              _AccountTile(
+                onOpenProfile: _openMyProfile,
+                onLogout: _logout,
+              ),
+            ],
           ),
-          // 左下角的账号头像：未登录显示登录入口，登录后点进自己的主页
-          const Divider(height: 1),
-          _AccountTile(
-            onOpenProfile: _openMyProfile,
-            onLogout: _logout,
-          ),
+
+          // 程序图标：只有红色的 H（不带底），**浮在导航之上**。
+          //
+          // 为什么要单独抽成 SidebarLogo：直接放在上面那个 Column 里时，
+          // 图标要比 NavigationRail 的起点更靠下，下半截会被导航的
+          // 背景 Material 盖掉（实测只画出 12x15，少了一半）。
+          // 它是 Stack 里后画的那个，位置细节见 widgets/hanime_logo.dart。
+          const SidebarLogo(),
         ],
       ),
     );
@@ -428,14 +650,15 @@ class _MainShellState extends State<MainShell> {
 
     await AuthController.logout();
 
+    // 退出后清掉本地保存的密码（账号条目保留，下次仍能快捷登录）
+    await SavedAccounts.forgetPasswords();
+
     if (!mounted) return;
 
     // 切回未登录作用域，页面按新作用域重建
     setState(() {});
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('已退出登录')),
-    );
+    AppToast.show(context, '已退出登录');
   }
 
   /// 打开「我的主页」（点赞过的影片、储存的播放清单都在这里）
@@ -479,12 +702,9 @@ class _MainShellState extends State<MainShell> {
     final changed = AccountScope.prefix != before;
 
     if (ok == true || changed) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            ok == true ? '登录成功，数据已切换到该账号' : '账号已切换',
-          ),
-        ),
+      AppToast.success(
+        context,
+        ok == true ? '登录成功，数据已切换到该账号' : '账号已切换',
       );
     }
   }
@@ -503,6 +723,34 @@ class _MainShellState extends State<MainShell> {
     );
   }
 
+  /// 内容区顶部要不要给右上角那三个窗口按钮让位。
+  ///
+  /// 窗口按钮是浮在最上面的实心控件（各 46x38，占右上角 138x38），
+  /// 所以页面顶部**靠右有通栏内容**时会和它们叠在一起。
+  ///
+  /// 实测过每一个页面：
+  /// - 首页（"最新上市 / 查看更多"那一行）、观看记录、播放清单、
+  ///   新番预告、下载页 —— 顶部都是通栏内容，**要让**；
+  /// - 搜索页（顶部只有居中的搜索框，离右边很远）、
+  ///   设置页（顶部只有左边一段说明文字，第一张卡片从 y≈95 才开始）
+  ///   —— **不用让**，让了就是白留一条。
+  ///
+  /// 窄窗口下不用管：那里有 AppBar（40 高），内容本来就从 40 开始。
+  double _topInsetFor(_MainSection section) {
+    switch (section) {
+      case _MainSection.search:
+      case _MainSection.settings:
+        return 0;
+
+      case _MainSection.home:
+      case _MainSection.history:
+      case _MainSection.playlist:
+      case _MainSection.newRelease:
+      case _MainSection.downloads:
+        return AppWindow.titleBarHeight;
+    }
+  }
+
   Widget _buildShell(bool wide) {
     if (wide) {
       return Scaffold(
@@ -511,13 +759,17 @@ class _MainShellState extends State<MainShell> {
             _buildNavigation(),
             const VerticalDivider(width: 1),
             Expanded(
-              child: _buildPage(),              
+              child: Padding(
+                padding: EdgeInsets.only(top: _topInsetFor(_section)),
+                child: _buildPage(),
+              ),
             ),
           ],
         ),
       );
     }
 
+    // 窄窗口：AppBar 自己会吃掉 MediaQuery 的顶部留白，不用额外处理
     return Scaffold(
       appBar: AppBar(
         title: const SizedBox.shrink(),
@@ -546,8 +798,6 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  static const String _cacheKey = 'home_sections';
-
   List<Map<String, dynamic>> _sections = [];
   bool _loading = true;
   String? _error;
@@ -556,8 +806,12 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
 
+    // 设置页里拖完栏目顺序要立刻生效。
+    // 首页是常驻页面（IndexedStack 里活着），不监听的话回来还是旧顺序。
+    AppSettings.homeSectionOrder.addListener(_onOrderChanged);
+
     // 先看缓存：有就直接显示，避免启动时白屏等网络
-    final cached = AppCache.get(_cacheKey);
+    final cached = AppCache.get(AppCache.homeSectionsKey);
 
     if (cached is List) {
       _sections = List<Map<String, dynamic>>.from(cached);
@@ -568,6 +822,27 @@ class _HomePageState extends State<HomePage> {
 
     _loadHomeVideos();
   }
+
+  @override
+  void dispose() {
+    AppSettings.homeSectionOrder.removeListener(_onOrderChanged);
+
+    super.dispose();
+  }
+
+  void _onOrderChanged() {
+    if (mounted) setState(() {});
+  }
+
+  /// 按用户在设置里排的顺序整理栏目，视频跟着栏目一起走。
+  ///
+  /// 具体的排序规则（没排过的排最后、保证稳定）在
+  /// [AppSettings.applyHomeOrder] 里，那边有测试。
+  List<Map<String, dynamic>> get _orderedSections =>
+      AppSettings.applyHomeOrder(
+        _sections,
+        (section) => section['name']?.toString() ?? '',
+      );
 
   Future<void> _loadHomeVideos() async {
     setState(() {
@@ -595,7 +870,11 @@ class _HomePageState extends State<HomePage> {
       );
 
       if (sections.isNotEmpty) {
-        AppCache.set(_cacheKey, sections, ttl: AppCache.homeTtl);
+        AppCache.set(
+          AppCache.homeSectionsKey,
+          sections,
+          ttl: AppCache.homeTtl,
+        );
       }
 
       if (mounted) {
@@ -634,15 +913,6 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  int _columnsFor(double width) {
-    if (width >= 1600) return 6;
-    if (width >= 1300) return 5;
-    if (width >= 1000) return 4;
-    if (width >= 750) return 3;
-    if (width >= 500) return 2;
-    return 1;
-  }
-
   void _openCategory(String name, String url) {
     final uri = Uri.tryParse(url);
 
@@ -661,66 +931,6 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Widget _buildCard(Map<String, dynamic> video) {
-    final thumbnail =
-        video['thumbnail']?.toString() ?? '';
-    final title = video['title']?.toString() ?? '';
-    final duration =
-        video['duration']?.toString() ?? '';
-    final rating = video['rating']?.toString() ?? '';
-    final views = video['views']?.toString() ?? '';
-
-    return Card(
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: () => _openVideo(video),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            AspectRatio(
-              aspectRatio: 16 / 9,
-              child: thumbnail.isNotEmpty
-                  ? Image.network(
-                      thumbnail,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, _, _) => Container(
-                        color: Colors.black12,
-                        alignment: Alignment.center,
-                        child: const Icon(Icons.broken_image),
-                      ),
-                    )
-                  : Container(
-                      color: Colors.black12,
-                      alignment: Alignment.center,
-                      child: const Icon(Icons.image_not_supported),
-                    ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
-              child: Text(
-                title,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontWeight: FontWeight.w600),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-              child: Text(
-                [duration, rating, views]
-                    .where((v) => v.isNotEmpty)
-                    .join(' · '),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
   Widget _buildSection(
     Map<String, dynamic> section,
     double maxWidth,
@@ -734,18 +944,6 @@ class _HomePageState extends State<HomePage> {
     if (videos.isEmpty) {
       return const SizedBox.shrink();
     }
-
-    final columns = _columnsFor(maxWidth);
-
-    const horizontalPadding = 48.0;
-    const crossAxisSpacing = 16.0;
-
-    final availableWidth = maxWidth -
-        horizontalPadding -
-        crossAxisSpacing * (columns - 1);
-    final itemWidth = availableWidth / columns;
-    final thumbnailHeight = itemWidth * 9 / 16;
-    final itemHeight = thumbnailHeight + 92;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -777,19 +975,14 @@ class _HomePageState extends State<HomePage> {
                 ),
             ],
           ),
-        ),        
-        GridView.builder(
+        ),
+
+        // 尺寸由 widgets/video_card.dart 统一提供，
+        // 首页就是这套尺寸的标准，别的页面都向它对齐。
+        VideoCardGrid(
+          videos: videos,
           shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-          padding: const EdgeInsets.symmetric(horizontal: 24),
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: columns,
-            crossAxisSpacing: crossAxisSpacing,
-            mainAxisSpacing: 16,
-            mainAxisExtent: itemHeight,
-          ),
-          itemCount: videos.length,
-          itemBuilder: (_, index) => _buildCard(videos[index]),
+          onTap: _openVideo,
         ),
       ],
     );
@@ -839,16 +1032,116 @@ class _HomePageState extends State<HomePage> {
       onRefresh: _loadHomeVideos,
       child: LayoutBuilder(
         builder: (context, constraints) {
+          final sections = _orderedSections;
+
           return ListView.builder(
             padding: const EdgeInsets.only(bottom: 24),
-            itemCount: _sections.length,
+            itemCount: sections.length,
             itemBuilder: (_, index) => _buildSection(
-              _sections[index],
+              sections[index],
               constraints.maxWidth,
             ),
           );
         },
       ),
+    );
+  }
+}
+
+/// 首页栏目排序对话框：拖着重排，即时生效。
+///
+/// 单独一个 StatefulWidget 是因为拖动过程中要记住当前顺序。
+class _HomeSectionOrderDialog extends StatefulWidget {
+  /// 当前顺序（已经是用户排过的了）
+  final List<String> names;
+
+  const _HomeSectionOrderDialog({required this.names});
+
+  @override
+  State<_HomeSectionOrderDialog> createState() =>
+      _HomeSectionOrderDialogState();
+}
+
+class _HomeSectionOrderDialogState extends State<_HomeSectionOrderDialog> {
+  late final List<String> _names = [...widget.names];
+
+  Future<void> _onReorder(int oldIndex, int newIndex) async {
+    setState(() {
+      // 用 onReorderItem 而不是旧的 onReorder：它给的 newIndex
+      // **已经**是移除之后的下标了，不用自己再减一。
+      final moved = _names.removeAt(oldIndex);
+
+      _names.insert(newIndex, moved);
+    });
+
+    await AppSettings.setHomeSectionOrder(_names);
+  }
+
+  Future<void> _reset() async {
+    await AppSettings.setHomeSectionOrder(const []);
+
+    if (mounted) Navigator.of(context).pop();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return AlertDialog(
+      title: const Text('首页栏目排序'),
+      content: SizedBox(
+        width: 420,
+        height: 460,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '按住右边的把手上下拖。视频会跟着栏目一起移动。',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: ReorderableListView.builder(
+                buildDefaultDragHandles: false,
+                itemCount: _names.length,
+                onReorderItem: (oldIndex, newIndex) {
+                  _onReorder(oldIndex, newIndex);
+                },
+                itemBuilder: (context, index) => Card(
+                  key: ValueKey(_names[index]),
+                  margin: const EdgeInsets.only(bottom: 6),
+                  child: ListTile(
+                    dense: true,
+                    leading: Text(
+                      '${index + 1}',
+                      style: TextStyle(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    title: Text(_names[index]),
+                    trailing: ReorderableDragStartListener(
+                      index: index,
+                      child: const Icon(Icons.drag_handle),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _reset,
+          child: const Text('恢复默认顺序'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('完成'),
+        ),
+      ],
     );
   }
 }
@@ -1222,9 +1515,7 @@ class _SearchPageState extends State<SearchPage> {
     } catch (e) {
       if (!mounted) return;
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('标签加载失败：$e')),
-      );
+      AppToast.error(context, '标签加载失败：$e');
     }
   }
 
@@ -1479,102 +1770,6 @@ class _SearchPageState extends State<SearchPage> {
     );
   }
 
-  int _columnsFor(double width) {
-    if (_isPortraitCategory) {
-      if (width >= 1600) return 8;
-      if (width >= 1300) return 7;
-      if (width >= 1000) return 5;
-      if (width >= 750) return 4;
-      if (width >= 500) return 2;
-      return 1;
-    }
-
-    if (width >= 1600) return 6;
-    if (width >= 1300) return 5;
-    if (width >= 1000) return 4;
-    if (width >= 750) return 3;
-    if (width >= 500) return 2;
-    return 1;
-  }
-
-  Widget _buildResultCard(Map<String, dynamic> video) {
-    final thumbnail =
-        video['thumbnail']?.toString() ?? '';
-    final title = video['title']?.toString() ?? '';
-    final duration =
-        video['duration']?.toString() ?? '';
-    final rating = video['rating']?.toString() ?? '';
-    final views = video['views']?.toString() ?? '';
-
-    final meta = [duration, rating, views]
-        .where((v) => v.isNotEmpty)
-        .join(' · ');
-
-    return Card(
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: () {
-          final id = _extractVideoId(
-            video['url']?.toString() ?? '',
-          );
-
-          if (id == null) return;
-
-          Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (_) => VideoDetailPage(videoId: id),
-            ),
-          );
-        },
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            AspectRatio(
-              aspectRatio:
-                  _isPortraitCategory ? 268 / 394 : 16 / 9,
-              child: thumbnail.isNotEmpty
-                  ? Image.network(
-                      thumbnail,
-                      fit: BoxFit.cover,
-                      errorBuilder: (_, _, _) => Container(
-                        color: Colors.black12,
-                        alignment: Alignment.center,
-                        child: const Icon(Icons.broken_image),
-                      ),
-                    )
-                  : Container(
-                      color: Colors.black12,
-                      alignment: Alignment.center,
-                      child: const Icon(Icons.image_not_supported),
-                    ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
-              child: Text(
-                title,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontWeight: FontWeight.w600),
-              ),
-            ),
-            if (meta.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-                child: Text(
-                  meta,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              )
-            else
-              const SizedBox(height: 12),
-          ],
-        ),
-      ),
-    );
-  }
 
   Widget _buildHistoryPanel() {
     final theme = Theme.of(context);
@@ -1772,39 +1967,28 @@ class _SearchPageState extends State<SearchPage> {
                             )
                           : _results.isEmpty
                               ? _buildEmptyState()
-                              : LayoutBuilder(
-                                  builder: (context, constraints) {
-                                    final columns = _columnsFor(
-                                        constraints.maxWidth);
+                              : VideoCardGrid(
+                                  videos: _results,
+                                  // 竖版栏目（比如新番预告）保持竖版那套，
+                                  // 其余一律和首页一样的横版卡片
+                                  portrait: _isPortraitCategory,
+                                  aspectRatio: _isPortraitCategory
+                                      ? 268 / 394
+                                      : 16 / 9,
+                                  padding: EdgeInsets.zero,
+                                  onTap: (video) {
+                                    final id = _extractVideoId(
+                                      video['url']?.toString() ?? '',
+                                    );
 
-                                    const crossAxisSpacing = 12.0;
+                                    if (id == null) return;
 
-                                    final availableWidth =
-                                        constraints.maxWidth -
-                                            crossAxisSpacing *
-                                                (columns - 1);
-                                    final itemWidth =
-                                        availableWidth / columns;
-                                    final thumbnailHeight =
-                                        _isPortraitCategory
-                                            ? itemWidth * 394 / 268
-                                            : itemWidth * 9 / 16;
-                                    final itemHeight =
-                                        thumbnailHeight + 92;
-
-                                    return GridView.builder(
-                                      padding: EdgeInsets.zero,
-                                      gridDelegate:
-                                          SliverGridDelegateWithFixedCrossAxisCount(
-                                        crossAxisCount: columns,
-                                        crossAxisSpacing: crossAxisSpacing,
-                                        mainAxisSpacing: 12,
-                                        mainAxisExtent: itemHeight,
+                                    Navigator.push(
+                                      context,
+                                      MaterialPageRoute(
+                                        builder: (_) =>
+                                            VideoDetailPage(videoId: id),
                                       ),
-                                      itemCount: _results.length,
-                                      itemBuilder: (_, index) =>
-                                          _buildResultCard(
-                                              _results[index]),
                                     );
                                   },
                                 ),
@@ -2234,31 +2418,22 @@ class _HistoryPageState
 
     return Column(
       children: [
-        // 「清空」只对本地记录有意义；官网记录要在官网上清
-        Padding(
-          padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
-          child: Row(
-            children: [
-              Text(
-                _isOnline ? '观看记录（与个人主页一致）' : '观看记录（本地）',
-                style: TextStyle(
-                  fontSize: 12.5,
-                  color: Theme.of(context)
-                      .colorScheme
-                      .onSurface
-                      .withValues(alpha: 0.6),
-                ),
+        // 「观看记录（与个人主页一致）」那行说明文字去掉了 ——
+        // 侧边栏已经写着"观看记录"，顶上再挂一行只是白占地方。
+        // 「清空历史」是有用的功能，保留，靠右对齐。
+        // （只在本地记录时才有，官网记录要去官网上清）
+        if (!_isOnline)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 8, 24, 0),
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: TextButton.icon(
+                onPressed: _clearHistory,
+                icon: const Icon(Icons.delete_outline),
+                label: const Text('清空历史'),
               ),
-              const Spacer(),
-              if (!_isOnline)
-                TextButton.icon(
-                  onPressed: _clearHistory,
-                  icon: const Icon(Icons.delete_outline),
-                  label: const Text('清空历史'),
-                ),
-            ],
+            ),
           ),
-        ),
         Expanded(
           child: ListView.builder(
             padding:
@@ -2392,31 +2567,13 @@ class _HistoryPageState
         ),
 
         // 官网观看记录每页 60 条，页数多，必须能翻页
-        if (_isOnline && _totalPages > 1)
-          Padding(
+        if (_isOnline)
+          PagerBar(
+            page: _page,
+            totalPages: _totalPages,
+            loading: _loading,
             padding: const EdgeInsets.fromLTRB(24, 0, 24, 12),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                IconButton(
-                  tooltip: '上一页',
-                  onPressed: (_page > 1 && !_loading)
-                      ? () => _loadHistory(page: _page - 1)
-                      : null,
-                  icon: const Icon(Icons.chevron_left),
-                ),
-                const SizedBox(width: 8),
-                Text('第 $_page / $_totalPages 页'),
-                const SizedBox(width: 8),
-                IconButton(
-                  tooltip: '下一页',
-                  onPressed: (_page < _totalPages && !_loading)
-                      ? () => _loadHistory(page: _page + 1)
-                      : null,
-                  icon: const Icon(Icons.chevron_right),
-                ),
-              ],
-            ),
+            onGoToPage: (target) => _loadHistory(page: target),
           ),
       ],
     );
@@ -2431,6 +2588,419 @@ class SettingsPage extends StatefulWidget {
 }
 
 class _SettingsPageState extends State<SettingsPage> {
+  /// 后端设置（下载目录）
+  String _downloadDir = '';
+  String _defaultDownloadDir = '';
+  String _hanimeRoot = '';
+  bool _settingsLoading = true;
+
+  /// 缓存情况
+  int _cacheEntries = 0;
+  Map<String, dynamic> _cacheDetail = {};
+  bool _cacheLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadBackendSettings();
+    _loadCacheStats();
+  }
+
+  Future<void> _loadBackendSettings() async {
+    try {
+      final response = await http
+          .get(Uri.parse('${AppConfig.backendBase}/api/settings'))
+          .timeout(const Duration(seconds: 30));
+
+      if (response.statusCode != 200) {
+        throw Exception('HTTP ${response.statusCode}');
+      }
+
+      final data = jsonDecode(response.body);
+
+      if (!mounted) return;
+
+      setState(() {
+        _downloadDir = data['download_dir']?.toString() ?? '';
+        _defaultDownloadDir =
+            data['default_download_dir']?.toString() ?? '';
+        _hanimeRoot = data['hanime_root']?.toString() ?? '';
+        _settingsLoading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() => _settingsLoading = false);
+    }
+  }
+
+  Future<void> _loadCacheStats() async {
+    setState(() => _cacheLoading = true);
+
+    try {
+      final response = await http
+          .get(Uri.parse('${AppConfig.backendBase}/api/cache_stats'))
+          .timeout(const Duration(seconds: 30));
+
+      final data = jsonDecode(response.body);
+
+      if (!mounted) return;
+
+      setState(() {
+        _cacheDetail = Map<String, dynamic>.from(data);
+        _cacheEntries = _countCacheEntries(data);
+        _cacheLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+
+      setState(() => _cacheLoading = false);
+    }
+  }
+
+  /// 后端返回的是 {"home": {"entries": N, "hits": ...}, ...} 这种嵌套结构
+  int _countCacheEntries(dynamic data) {
+    if (data is! Map) return 0;
+
+    var total = 0;
+
+    for (final value in data.values) {
+      if (value is Map) {
+        final n = value['entries'];
+
+        if (n is int) total += n;
+      } else if (value is int) {
+        total += value;
+      }
+    }
+
+    return total;
+  }
+
+  int _entriesOf(String key) {
+    final value = _cacheDetail[key];
+
+    if (value is Map) {
+      final n = value['entries'];
+
+      if (n is int) return n;
+    }
+
+    return 0;
+  }
+
+  Future<void> _clearCache() async {
+    try {
+      await http
+          .get(Uri.parse('${AppConfig.backendBase}/api/cache_clear'))
+          .timeout(const Duration(seconds: 60));
+
+      // 客户端自己那层缓存也一起清掉，不然界面还是旧的
+      AppCache.clear();
+
+      if (!mounted) return;
+
+      AppToast.success(context, '缓存已清空');
+
+      await _loadCacheStats();
+    } catch (e) {
+      if (mounted) AppToast.error(context, '清空失败：$e');
+    }
+  }
+
+  Future<void> _changeDownloadDir() async {
+    final controller = TextEditingController(text: _downloadDir);
+
+    final target = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('修改下载目录'),
+        content: SizedBox(
+          width: 460,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              TextField(
+                controller: controller,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  labelText: '目录路径',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                '目录不存在会自动建出来。默认是 $_defaultDownloadDir',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () =>
+                Navigator.of(context).pop(_defaultDownloadDir),
+            child: const Text('恢复默认'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.of(context).pop(controller.text.trim()),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+
+    controller.dispose();
+
+    if (target == null || target.isEmpty || !mounted) return;
+
+    if (target == _downloadDir) return;
+
+    try {
+      final response = await http
+          .post(
+            Uri.parse('${AppConfig.backendBase}/api/settings'),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({'download_dir': target}),
+          )
+          .timeout(const Duration(seconds: 60));
+
+      final data = jsonDecode(response.body);
+
+      if (!mounted) return;
+
+      if (response.statusCode != 200) {
+        throw Exception(
+          data is Map ? (data['detail'] ?? '保存失败') : '保存失败',
+        );
+      }
+
+      setState(() => _downloadDir = data['download_dir']?.toString() ?? target);
+
+      AppToast.success(context, '下载目录已修改');
+    } catch (e) {
+      if (mounted) AppToast.error(context, '$e');
+    }
+  }
+
+  Future<void> _openDownloadDir() async {
+    if (_downloadDir.isEmpty) return;
+
+    try {
+      // 目录可能还没建（一次都没下载过），先让后端建出来
+      await http
+          .post(
+            Uri.parse('${AppConfig.backendBase}/api/settings'),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({'download_dir': _downloadDir}),
+          )
+          .timeout(const Duration(seconds: 30));
+
+      await Process.run('explorer.exe', [_downloadDir]);
+
+      if (mounted) AppToast.success(context, '已打开下载目录');
+    } catch (e) {
+      if (mounted) AppToast.error(context, '打不开：$e');
+    }
+  }
+
+  Widget _sectionTitle(String title, [String? subtitle]) {
+    final theme = Theme.of(context);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 28),
+        Text(
+          title,
+          style: theme.textTheme.titleLarge?.copyWith(
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        if (subtitle != null) ...[
+          const SizedBox(height: 8),
+          Text(
+            subtitle,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+        const SizedBox(height: 12),
+      ],
+    );
+  }
+
+  /// 一行设置项：左边图标 + 标题/说明，右边是当前值（可点开选择）
+  Widget _settingTile({
+    required IconData icon,
+    required String title,
+    required String value,
+    String subtitle = '',
+    VoidCallback? onTap,
+    Widget? trailing,
+  }) {
+    final theme = Theme.of(context);
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 8),
+      child: ListTile(
+        leading: Icon(icon, color: theme.colorScheme.primary),
+        title: Text(title),
+        subtitle: subtitle.isEmpty
+            ? null
+            : Text(
+                subtitle,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+        trailing: trailing ??
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 240),
+                  child: Text(
+                    value,
+                    textAlign: TextAlign.right,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+                if (onTap != null) ...[
+                  const SizedBox(width: 4),
+                  const Icon(Icons.chevron_right, size: 20),
+                ],
+              ],
+            ),
+        onTap: onTap,
+      ),
+    );
+  }
+
+  /// 让用户拖着重排首页栏目。
+  ///
+  /// 栏目名从首页的缓存里拿（设置页自己没有那份数据）；
+  /// 缓存过期了（5 分钟）就现拉一次接口 —— 排顺序只需要栏目名。
+  ///
+  /// 拖动是**即时生效**的：每拖一次就写一次设置，首页那边监听着立刻重排。
+  /// 不搞「保存/取消」那一套，省得用户拖完忘了点保存。
+  Future<void> _reorderHomeSections() async {
+    final names = await _loadHomeSectionNames();
+
+    if (!mounted) return;
+
+    if (names.isEmpty) {
+      AppToast.error(
+        context,
+        '还没拿到首页栏目。先打开一次「首页」再回来排。',
+      );
+
+      return;
+    }
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => _HomeSectionOrderDialog(names: names),
+    );
+  }
+
+  /// 取首页栏目名（按用户已经排过的顺序）。
+  Future<List<String>> _loadHomeSectionNames() async {
+    List<String> namesOf(List<dynamic> raw) => [
+          for (final item in raw)
+            if (item is Map && (item['name']?.toString() ?? '').isNotEmpty)
+              item['name'].toString(),
+        ];
+
+    final cached = AppCache.get(AppCache.homeSectionsKey);
+
+    if (cached is List && cached.isNotEmpty) {
+      return AppSettings.applyHomeOrder<String>(
+        namesOf(cached),
+        (name) => name,
+      );
+    }
+
+    try {
+      final response = await http.get(
+        Uri.parse('${AppConfig.backendBase}/api/home_sections'),
+      );
+
+      if (response.statusCode != 200) return const [];
+
+      final data = jsonDecode(response.body);
+
+      final sections = List<Map<String, dynamic>>.from(
+        data['sections'] ?? [],
+      );
+
+      if (sections.isEmpty) return const [];
+
+      AppCache.set(
+        AppCache.homeSectionsKey,
+        sections,
+        ttl: AppCache.homeTtl,
+      );
+
+      return AppSettings.applyHomeOrder<String>(
+        [
+          for (final section in sections)
+            if ((section['name']?.toString() ?? '').isNotEmpty)
+              section['name'].toString(),
+        ],
+        (name) => name,
+      );
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// 从一组选项里挑一个
+  Future<T?> _pickOption<T>({
+    required String title,
+    required List<T> options,
+    required T current,
+    required String Function(T) label,
+  }) {
+    return showDialog<T>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: Text(title),
+        children: [
+          for (final option in options)
+            SimpleDialogOption(
+              onPressed: () => Navigator.of(context).pop(option),
+              child: Row(
+                children: [
+                  Icon(
+                    option == current
+                        ? Icons.radio_button_checked
+                        : Icons.radio_button_unchecked,
+                    size: 20,
+                    color: option == current
+                        ? Theme.of(context).colorScheme.primary
+                        : null,
+                  ),
+                  const SizedBox(width: 12),
+                  Text(label(option)),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -2487,6 +3057,159 @@ class _SettingsPageState extends State<SettingsPage> {
               ],
             );
           },
+        ),
+
+        // ---------------- 首页 ----------------
+        _sectionTitle('首页', '首页上各栏目的顺序'),
+
+        ValueListenableBuilder<List<String>>(
+          valueListenable: AppSettings.homeSectionOrder,
+          builder: (context, order, _) => _settingTile(
+            icon: Icons.reorder,
+            title: '栏目排序',
+            subtitle: '拖动调整首页栏目的先后（视频跟着栏目一起走）',
+            value: order.isEmpty ? '网站默认' : '已自定义 ${order.length} 项',
+            onTap: _reorderHomeSections,
+          ),
+        ),
+
+        // ---------------- 播放器 ----------------
+        _sectionTitle('播放器', '键盘快捷键和播放行为'),
+
+        ValueListenableBuilder<int>(
+          valueListenable: AppSettings.seekStep,
+          builder: (context, step, _) => _settingTile(
+            icon: Icons.fast_forward_outlined,
+            title: '左右键快进步长',
+            subtitle: '按一下 ← / → 跳过多少秒',
+            value: '$step 秒',
+            onTap: () async {
+              final picked = await _pickOption<int>(
+                title: '左右键快进步长',
+                options: AppSettings.seekStepOptions,
+                current: step,
+                label: (v) => '$v 秒',
+              );
+
+              if (picked != null) await AppSettings.setSeekStep(picked);
+            },
+          ),
+        ),
+
+        ValueListenableBuilder<double>(
+          valueListenable: AppSettings.holdSpeed,
+          builder: (context, speed, _) => _settingTile(
+            icon: Icons.speed,
+            title: '长按右键倍速',
+            subtitle: '按住 → 不放时的播放速度',
+            value: '${speed}x',
+            onTap: () async {
+              final picked = await _pickOption<double>(
+                title: '长按右键倍速',
+                options: AppSettings.holdSpeedOptions,
+                current: speed,
+                label: (v) => '${v}x',
+              );
+
+              if (picked != null) await AppSettings.setHoldSpeed(picked);
+            },
+          ),
+        ),
+
+        ValueListenableBuilder<bool>(
+          valueListenable: AppSettings.autoResume,
+          builder: (context, enabled, _) => _settingTile(
+            icon: Icons.restore,
+            title: '自动续播',
+            subtitle: '打开影片时从上次看到的位置继续',
+            value: enabled ? '已开启' : '已关闭',
+            trailing: Switch(
+              value: enabled,
+              onChanged: (v) => AppSettings.setAutoResume(v),
+            ),
+          ),
+        ),
+
+        // ---------------- 下载 ----------------
+        _sectionTitle('下载', '文件保存位置和默认清晰度'),
+
+        _settingTile(
+          icon: Icons.folder_outlined,
+          title: '下载目录',
+          subtitle: _settingsLoading ? '读取中…' : _downloadDir,
+          value: '',
+          trailing: _settingsLoading
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      tooltip: '打开目录',
+                      onPressed: _downloadDir.isEmpty
+                          ? null
+                          : _openDownloadDir,
+                      icon: const Icon(Icons.open_in_new, size: 20),
+                    ),
+                    IconButton(
+                      tooltip: '修改',
+                      onPressed: _changeDownloadDir,
+                      icon: const Icon(Icons.edit_outlined, size: 20),
+                    ),
+                  ],
+                ),
+        ),
+
+        ValueListenableBuilder<String>(
+          valueListenable: AppSettings.downloadQuality,
+          builder: (context, quality, _) => _settingTile(
+            icon: Icons.high_quality_outlined,
+            title: '默认下载清晰度',
+            subtitle: '下载时默认选中的清晰度',
+            value: quality.isEmpty ? '最高可用' : quality,
+            onTap: () async {
+              final picked = await _pickOption<String>(
+                title: '默认下载清晰度',
+                options: const ['', '1080p', '720p', '480p'],
+                current: quality,
+                label: (v) => v.isEmpty ? '最高可用' : v,
+              );
+
+              if (picked != null) {
+                await AppSettings.setDownloadQuality(picked);
+              }
+            },
+          ),
+        ),
+
+        // ---------------- 缓存 ----------------
+        _sectionTitle('缓存', '后端会把取到的页面缓存一段时间，避免重复访问网站'),
+
+        _settingTile(
+          icon: Icons.cleaning_services_outlined,
+          title: '清空接口缓存',
+          subtitle: _cacheLoading
+              ? '统计中…'
+              : '当前缓存 $_cacheEntries 项'
+                  '（详情 ${_entriesOf('detail')} / 搜索 ${_entriesOf('search')} / 首页 ${_entriesOf('home')} / 清单 ${_entriesOf('playlist')}）',
+          value: '',
+          trailing: FilledButton.tonal(
+            onPressed: _cacheLoading ? null : _clearCache,
+            child: const Text('清空'),
+          ),
+        ),
+
+        // ---------------- 关于 ----------------
+        _sectionTitle('关于'),
+
+        _settingTile(
+          icon: Icons.folder_special_outlined,
+          title: '应用数据目录',
+          subtitle: _hanimeRoot.isEmpty ? '读取中…' : _hanimeRoot,
+          value: '',
         ),
       ],
     );
@@ -2584,43 +3307,6 @@ class _ThemeOptionTile extends StatelessWidget {
   }
 }
 
-class _PlaceholderPage
-    extends StatelessWidget {
-  final IconData icon;
-  final String title;
-  final String message;
-
-  const _PlaceholderPage({
-    required this.icon,
-    required this.title,
-    required this.message,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Column(
-        mainAxisSize:
-            MainAxisSize.min,
-        children: [
-          Icon(
-            icon,
-            size: 64,
-          ),
-          const SizedBox(height: 16),
-          Text(
-            title,
-            style: Theme.of(context)
-                .textTheme
-                .headlineSmall,
-          ),
-          const SizedBox(height: 8),
-          Text(message),
-        ],
-      ),
-    );
-  }
-}
 
 class VideoDetailPage
     extends StatefulWidget {
@@ -2646,11 +3332,14 @@ class _VideoDetailPageState
   bool _loading = true;
   String? _error;
 
-  /// 点赞 / 储存请求进行中
-  bool _acting = false;
+  /// 下载进行中 + 百分比
+  bool _downloading = false;
+  int _downloadPercent = 0;
 
-  /// 本影片详情在 AppCache 里的 key
-  String get _detailCacheKey => 'video_detail_${widget.videoId}';
+  /// 当前账号对这部影片的互动状态（用来点亮图标）
+  bool _liked = false;
+  bool _saved = false;
+  String _savedPlaylist = '';
 
   VideoPlayerController?
       _videoPlayerController;
@@ -2667,7 +3356,11 @@ class _VideoDetailPageState
 
   final Map<String, GlobalKey> _playlistKeys = {};
 
-  double _volume = 1.0;
+  // 音量沿用上次的（用户要求记住上次播放设置的音量）
+  double _volume = AppSettings.lastVolume.value;
+
+  /// 音量提示：放进播放器自己的 Stack 里，才跟得上播放器的位置
+  final VolumeToastController _volumeToast = VolumeToastController();
 
   bool _showVolumeSlider = false;
   Timer? _volumeHideTimer;
@@ -2719,6 +3412,12 @@ class _VideoDetailPageState
 
         _playlist = playlist;
 
+        // 互动状态直接来自详情接口（后端已从 HTML 里解析好），
+        // 不再单独调 /state 导航浏览器。
+        _liked = data['liked'] == true;
+        _saved = data['saved'] == true;
+        _savedPlaylist = data['saved_playlist']?.toString() ?? '';
+
         _availableSources =
             List<Map<String, dynamic>>.from(
           data['sources'] ?? [],
@@ -2732,7 +3431,11 @@ class _VideoDetailPageState
         }
       });
 
-      _scrollToCurrentVideo();
+      // 详情数据到位后把「正在播放的这一个」滚到列表中间。
+      // 等一帧再开始，因为上面这次 setState 还没触发 build。
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => _scrollToCurrentVideo(),
+      );
 
       final videoSource =
           data['video_source']
@@ -2861,6 +3564,14 @@ class _VideoDetailPageState
 
     await controller.initialize();
 
+    // 把上次记住的音量**真正设到播放器上**。
+    //
+    // 少了这一句就会出现：界面音量图标显示静音（因为 _volume 是 0），
+    // 但视频照样出声 —— 播放器还停在默认的满音量。
+    // 以前只有切画质 / 点静音 / 拖滑块时才 setVolume，
+    // 所以"上次设成静音、重启进来还是有声音"。
+    await controller.setVolume(_volume);
+
     await _restorePlaybackPosition();
 
     controller.addListener(
@@ -2961,6 +3672,9 @@ class _VideoDetailPageState
       'video_position',
       widget.videoId,
     );
+
+    // 用户可以在设置里关掉自动续播
+    if (!AppSettings.autoResume.value) return;
 
     final savedSeconds =
         prefs.getInt(key);
@@ -3166,6 +3880,7 @@ class _VideoDetailPageState
         ?.dispose();
 
     _playlistScrollController.dispose();
+    _volumeToast.dispose();
 
     super.dispose();
   }
@@ -3321,9 +4036,31 @@ class _VideoDetailPageState
                   ),
                 ),
               ),
+
+            // 调音量时在**播放器正中**显示（不是整页正中）。
+            // 放在这个 Stack 的最后，才会盖在画面和控制条上面。
+            _buildVolumeToast(),
           ],
         ),
       ),
+    );
+  }
+
+  /// 音量提示：跟着播放器走，窗口缩放时位置和大小都跟着变
+  Widget _buildVolumeToast() {
+    return ListenableBuilder(
+      listenable: _volumeToast,
+      builder: (context, _) {
+        if (!_volumeToast.visible) return const SizedBox.shrink();
+
+        return Positioned.fill(
+          child: IgnorePointer(
+            child: Center(
+              child: VolumeToast(volume: _volumeToast.volume!),
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -3479,6 +4216,7 @@ class _VideoDetailPageState
                             setState(() {
                               _volume = _volume == 0 ? 1 : 0;
                               controller.setVolume(_volume);
+                              AppSettings.setLastVolume(_volume);
                             });
                           },
                         ),
@@ -3516,6 +4254,8 @@ class _VideoDetailPageState
                                           _volume = value;
                                           controller.setVolume(value);
                                         });
+
+                                        AppSettings.setLastVolume(value);
                                       },
                                     ),
                                   ),
@@ -3619,6 +4359,8 @@ class _VideoDetailPageState
             setState(() {
               _volume = newVolume;
             });
+
+            AppSettings.setLastVolume(newVolume);
           },
         ),
       ),
@@ -3626,30 +4368,36 @@ class _VideoDetailPageState
 
     await windowManager.setFullScreen(false);
   }
-  void _scrollToCurrentVideo() {
-    final key =
-        _playlistKeys[widget.videoId];
+  /// 把「正在播放的这一个」滚到列表中间。
+  ///
+  /// 两个坑：
+  ///  1. 数据刚 setState 完时 ListView 还没 build，GlobalKey 的
+  ///     currentContext 是 null —— 只试一次会静默失败。所以这里重试几帧。
+  ///  2. 列表是懒加载的：当前项如果还没被创建，ensureVisible 也无从下手。
+  ///     所以先在**外层**滚动容器里滚到面板位置，让列表有机会渲染出来，
+  ///     再对列表内部做居中对齐。
+  void _scrollToCurrentVideo({int attempt = 0}) {
+    if (!mounted || attempt > 12) return;
 
-    if (key == null) {
+    final key = _playlistKeys[widget.videoId];
+    final context = key?.currentContext;
+
+    if (context == null) {
+      // 还没建出来，下一帧再试
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => _scrollToCurrentVideo(attempt: attempt + 1),
+      );
+
       return;
     }
 
-    WidgetsBinding.instance
-        .addPostFrameCallback((_) {
-      final context = key.currentContext;
-
-      if (context == null) {
-        return;
-      }
-
-      Scrollable.ensureVisible(
-        context,
-        duration:
-            const Duration(milliseconds: 500),
-        curve: Curves.easeInOut,
-        alignment: 0.5,
-      );
-    });
+    // 让列表里这一项居中（alignment 0.5 = 居中）
+    Scrollable.ensureVisible(
+      context,
+      duration: const Duration(milliseconds: 400),
+      curve: Curves.easeInOut,
+      alignment: 0.5,
+    );
   }
 
   Widget _buildPlaylistPanel() {
@@ -3983,18 +4731,22 @@ class _VideoDetailPageState
         _InfoRow(
           label: '品牌',
           value: brand,
+          icon: Icons.storefront_outlined,
         ),
         _InfoRow(
           label: '上传者',
           value: uploader,
+          icon: Icons.person_outline,
         ),
         _InfoRow(
           label: '观看次数',
           value: views,
+          icon: Icons.play_circle_outline,
         ),
         _InfoRow(
           label: '发行日期',
           value: releaseDate,
+          icon: Icons.calendar_today_outlined,
         ),
         const SizedBox(
           height: 16,
@@ -4032,9 +4784,49 @@ class _VideoDetailPageState
     return Scaffold(
       appBar: AppBar(
         title: const SizedBox.shrink(),
-      ),      
-      body: _buildBody(),
+        // 左上角：返回按钮右边再放一个「回到首页」。
+        // 默认 leading 只有一格宽（约 56），放两个按钮要自己加宽。
+        leadingWidth: 96,
+        leading: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              tooltip: '返回',
+              onPressed: () => Navigator.of(context).maybePop(),
+              icon: const Icon(Icons.arrow_back),
+            ),
+            IconButton(
+              tooltip: '回到首页',
+              onPressed: _goToHome,
+              icon: const Icon(Icons.home_outlined),
+            ),
+          ],
+        ),
+      ),
+      body: PlayerShortcuts(
+        player: () => _videoPlayerController,
+        volume: _volume,
+        onVolumeChanged: (v) {
+          setState(() => _volume = v);
+          AppSettings.setLastVolume(v);
+          _volumeToast.show(v);
+        },
+        seekStep: AppSettings.seekStep.value,
+        holdSpeed: AppSettings.holdSpeed.value,
+        // 详情页不是全屏，ESC 不做事（全屏播放器里才有用）
+        child: _buildBody(),
+      ),
     );
+  }
+
+  /// 回到首页：先把主页壳切到「首页」，再关掉所有 push 出来的页面。
+  ///
+  /// 顺序很重要 —— 先通知主壳切栏目，等它重建好了再 pop，
+  /// 这样露出主壳时就已经在首页，不会先闪一下原来的栏目。
+  void _goToHome() {
+    HomeRequest.go();
+
+    Navigator.of(context).popUntil((route) => route.isFirst);
   }
 
   Widget _buildBody() {
@@ -4168,60 +4960,554 @@ class _VideoDetailPageState
 
     final likeRatio = video['like_ratio']?.toString() ?? '';
     final likeCount = video['like_count']?.toString() ?? '';
+    final views = video['views']?.toString() ?? '';
+    final duration = video['duration']?.toString() ?? '';
+    final fileSize = video['file_size']?.toString() ?? '';
 
-    final downloadUrl = video['download_url']?.toString() ?? '';
+    final sources = (video['sources'] as List?) ?? const [];
+    final canDownload = sources.isNotEmpty;
 
     final hasArtist = artistName.isNotEmpty;
     final hasLike = likeCount.isNotEmpty || likeRatio.isNotEmpty;
 
-    if (!hasArtist && !hasLike && downloadUrl.isEmpty) {
-      return const SizedBox.shrink();
-    }
-
     final theme = Theme.of(context);
 
-    return Wrap(
-      spacing: 12,
-      runSpacing: 12,
-      crossAxisAlignment: WrapCrossAlignment.center,
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        if (hasArtist) _buildArtistChip(artistName, artistAvatar, artistUrl),
-
-        // 点赞 / 储存：登录后可以真正生效
-        if (hasLike)
-          _ActionChip(
-            icon: Icons.thumb_up_outlined,
-            label: '点赞',
-            trailing: likeRatio.isNotEmpty
-                ? '$likeRatio${likeCount.isNotEmpty ? ' · $likeCount' : ''}'
-                : likeCount,
-            color: theme.colorScheme.primary,
-            busy: _acting,
-            onTap: _acting ? null : () => _doVideoAction('like'),
+        // 影片信息条：每一项都带图标
+        //
+        // 这里**不再**放「点赞率」—— 它在发行商头像上方单独占一格，
+        // 而下面那排按钮里的「点赞」右边已经带着同一个数字了
+        // （重复显示，用户要求去掉上面那个）。
+        if (views.isNotEmpty || duration.isNotEmpty || fileSize.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                // 播放量：圆角矩形里一个居中的三角
+                if (views.isNotEmpty)
+                  InfoChip(
+                    kind: InfoChipKind.play,
+                    text: views,
+                    tooltip: '播放次数',
+                  ),
+                if (duration.isNotEmpty)
+                  InfoChip(
+                    kind: InfoChipKind.duration,
+                    text: duration,
+                    tooltip: '片长',
+                  ),
+                if (fileSize.isNotEmpty)
+                  InfoChip(
+                    kind: InfoChipKind.size,
+                    text: fileSize,
+                    tooltip: '文件大小',
+                  ),
+              ],
+            ),
           ),
 
-        _ActionChip(
-          icon: Icons.playlist_add,
-          label: '储存',
-          tooltip: '把影片存进你的播放清单',
-          busy: _acting,
-          onTap: _acting ? null : () => _doVideoAction('save'),
+        Wrap(
+          spacing: 12,
+          runSpacing: 12,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            if (hasArtist)
+              _buildArtistChip(artistName, artistAvatar, artistUrl),
+
+            // 点赞 / 储存 / 下载：都会真正作用到官网账号
+            if (hasLike)
+              _ActionChip(
+                // 未点赞 = 空心大拇指；已点赞 = 实心大拇指。
+                // 刻意**不改变颜色**（原来点赞后会变绿）——
+                // 只靠图标形状区分状态，和点踩按钮的观感一致。
+                //
+                // 这里不传 color：让它用中性的 onSurface 色，
+                // 深色/浅色模式下都清晰。
+                icon: _liked
+                    ? Icons.thumb_up
+                    : Icons.thumb_up_outlined,
+                label: _liked ? '已点赞' : '点赞',
+                tooltip: _liked
+                    ? '已点赞（再点一次取消）'
+                    : '点赞会同步到官网账号',
+                trailing: likeRatio.isNotEmpty
+                    ? '$likeRatio${likeCount.isNotEmpty ? ' · $likeCount' : ''}'
+                    : likeCount,
+                onTap: () => _doVideoAction(_liked ? 'unlike' : 'like'),
+              ),
+
+            _ActionChip(
+              // 未储存 = 空心书签；已储存 = 实心书签。
+              // 和点赞一样**只换图标形状、不变颜色**。
+              icon: _saved ? Icons.bookmark : Icons.bookmark_border,
+              label: _saved ? '已储存' : '储存',
+              tooltip: _saved
+                  ? (_savedPlaylist.isEmpty
+                      ? '已储存到播放清单（点击可取消）'
+                      : '已储存到「$_savedPlaylist」（点击可取消）')
+                  : '把影片存进官网的播放清单',
+              onTap: _choosePlaylistAndSave,
+            ),
+
+            if (canDownload)
+              _ActionChip(
+                icon: Icons.download_outlined,
+                label: _downloading ? '$_downloadPercent%' : '下载',
+                tooltip: canDownload
+                    ? '选择清晰度并下载到本机'
+                    : '这个影片没有可下载的地址',
+                onTap: _downloading ? null : _chooseQualityAndDownload,
+              ),
+          ],
         ),
 
-        if (downloadUrl.isNotEmpty)
-          _ActionChip(
-            icon: Icons.download_outlined,
-            label: '下载',
-            tooltip: downloadUrl,
+        if (_downloading)
+          Padding(
+            padding: const EdgeInsets.only(top: 10),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                LinearProgressIndicator(
+                  value: _downloadPercent > 0
+                      ? _downloadPercent / 100
+                      : null,
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '正在下载 $_downloadPercent%',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: theme.colorScheme.onSurface
+                        .withValues(alpha: 0.65),
+                  ),
+                ),
+              ],
+            ),
           ),
       ],
     );
   }
 
+  /// 打开「储存到播放清单」弹窗。
+  ///
+  /// 清单列表直接用**详情接口带回来的** `save_playlists`。
+  /// 那正是官网储存弹窗里的内容：**稍后观看 + 自己创建的清单**。
+  /// （收藏来的、别人建的清单不会出现在这里 —— 之前我额外去拉"全部清单"，
+  /// 结果把几百个收藏的清单也塞了进来，是错的。）
+  ///
+  /// 弹窗里点选只是标记，点「确认」才按差异统一提交。
+  Future<void> _choosePlaylistAndSave() async {
+    final video = _video ?? {};
+
+    var playlists = List<Map<String, dynamic>>.from(
+      video['save_playlists'] ?? [],
+    );
+
+    // 兜底：详情里没带清单（比如老的缓存）才去问后端
+    if (playlists.isEmpty) {
+      try {
+        final response = await http.get(
+          Uri.parse(
+            '${AppConfig.backendBase}/api/video/${widget.videoId}/playlists',
+          ),
+        ).timeout(const Duration(seconds: 90));
+
+        if (response.statusCode == 200) {
+          final data = jsonDecode(response.body);
+
+          playlists = List<Map<String, dynamic>>.from(
+            data['playlists'] ?? [],
+          );
+        }
+      } catch (_) {}
+    }
+
+    if (!mounted) return;
+
+    // 一个清单都没有也允许打开 —— 可以直接在里面新建
+    final checked = await showDialog<List<String>>(
+      context: context,
+      builder: (_) => SaveToPlaylistDialog(
+        playlists: playlists,
+        videoTitle: video['title']?.toString() ?? '',
+        onApply: _applyPlaylistChangesInBackground,
+        onCreate: _createPlaylist,
+      ),
+    );
+
+    if (!mounted || checked == null) return;
+
+    // 先按用户的选择把本地状态更新掉（乐观）。
+    //
+    // 关键：**必须把 `save_playlists` 里的 checked 也改掉**。
+    // 否则下次再点「储存」，弹窗还是拿这份旧数据，
+    // 于是明明刚取消储存、却仍然显示打钩+变色（之前就是这个 bug）。
+    setState(() {
+      final updated = <Map<String, dynamic>>[];
+
+      for (final p in playlists) {
+        final name = p['name']?.toString() ?? '';
+
+        updated.add({...p, 'checked': checked.contains(name)});
+      }
+
+      // 弹窗里新建出来的清单不在原始列表里，补进去
+      final known = {for (final p in updated) p['name']?.toString() ?? ''};
+
+      for (final name in checked) {
+        if (name.isEmpty || known.contains(name)) continue;
+
+        updated.add({'list_id': '', 'name': name, 'checked': true});
+      }
+
+      final videoMap = Map<String, dynamic>.from(_video ?? {});
+
+      videoMap['save_playlists'] = updated;
+      videoMap['saved'] = checked.isNotEmpty;
+
+      _video = videoMap;
+
+      _saved = checked.isNotEmpty;
+      _savedPlaylist = checked.isNotEmpty ? checked.first : '';
+    });
+  }
+
+  /// 把弹窗里算好的差异丢到后台提交。
+  ///
+  /// 不阻塞界面 —— 每次提交都要开一次浏览器页面（几秒），
+  /// 让用户干等没意义。失败时弹提示并把该项的勾选回滚。
+  void _applyPlaylistChangesInBackground(List<PlaylistChange> changes) {
+    unawaited(_applyPlaylistChanges(changes));
+  }
+
+  Future<void> _applyPlaylistChanges(
+    List<PlaylistChange> changes,
+  ) async {
+    final failed = <PlaylistChange>[];
+
+    for (final change in changes) {
+      final ok = await _toggleSaveInPlaylist(change.name, change.save);
+
+      if (!ok) failed.add(change);
+    }
+
+    if (!mounted) return;
+
+    // 有成功的就通知别的页面：稍后观看 / 播放清单这些列表的数据变了，
+    // 它们会静默刷新，不用用户手动点刷新或重新进页面。
+    if (failed.length < changes.length) {
+      DataRevision.bump();
+    }
+
+    if (failed.isEmpty) {
+      AppToast.success(
+        context,
+        changes.length == 1
+            ? (changes.first.save ? '已储存' : '已取消储存')
+            : '已更新 ${changes.length} 个清单',
+      );
+
+      return;
+    }
+
+    // 有失败：把这几项的显示改回去，并说明是哪几个
+    setState(() {
+      final videoMap = Map<String, dynamic>.from(_video ?? {});
+
+      final list = List<Map<String, dynamic>>.from(
+        videoMap['save_playlists'] ?? [],
+      );
+
+      for (final change in failed) {
+        for (final p in list) {
+          if (p['name']?.toString() == change.name) {
+            p['checked'] = !change.save;
+          }
+        }
+      }
+
+      videoMap['save_playlists'] = list;
+
+      // 重新算「有没有存在任何清单里」
+      final anyChecked = list.any((p) => p['checked'] == true);
+
+      videoMap['saved'] = anyChecked;
+
+      _video = videoMap;
+      _saved = anyChecked;
+      _savedPlaylist = anyChecked
+          ? (list.firstWhere(
+              (p) => p['checked'] == true,
+              orElse: () => const {'name': ''},
+            )['name']?.toString() ??
+                '')
+          : '';
+    });
+
+    AppToast.error(
+      context,
+      '这些清单没同步成功：${failed.map((c) => c.name).join('、')}',
+    );
+  }
+
+  /// 新建播放清单。成功返回新清单名，失败返回 null。
+  Future<String?> _createPlaylist(String title, String description) async {
+    if (!AuthController.isLoggedIn) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (_) => const LoginDialog(),
+      );
+
+      if (ok != true || !mounted) return null;
+    }
+
+    try {
+      final response = await http
+          .post(
+            Uri.parse('${AppConfig.backendBase}/api/playlist/create'),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'title': title,
+              'description': description,
+              'video_id': widget.videoId,
+            }),
+          )
+          .timeout(const Duration(seconds: 180));
+
+      final data = jsonDecode(response.body);
+
+      if (!mounted) return null;
+
+      if (response.statusCode != 200) {
+        final detail = data is Map ? data['detail']?.toString() : null;
+
+        throw Exception(detail ?? '新建失败（${response.statusCode}）');
+      }
+
+      AppToast.success(
+        context,
+        (data is Map ? data['message']?.toString() : null) ?? '已新建',
+      );
+
+      // 清单列表变了，缓存作废
+      AppCache.removeWherePrefix('/api/user/');
+      AppCache.removeWherePrefix('/api/playlist');
+
+      // 通知别的页面（个人主页的播放清单、侧边栏播放清单）刷新
+      DataRevision.bump();
+
+      final state = data is Map ? data['state'] : null;
+
+      return state is Map ? state['name']?.toString() : title;
+    } catch (e) {
+      if (mounted) AppToast.error(context, '$e');
+
+      return null;
+    }
+  }
+
+  /// 把「加入/移出某个清单」提交给后端。
+  ///
+  /// 返回是否成功 —— 弹窗据此决定哪几个清单要标成失败。
+  Future<bool> _toggleSaveInPlaylist(String playlistName, bool save) async {
+    if (!AuthController.isLoggedIn) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (_) => const LoginDialog(),
+      );
+
+      if (ok != true || !mounted) return false;
+    }
+
+    try {
+      final response = await http
+          .post(
+            Uri.parse(
+              '${AppConfig.backendBase}/api/video/'
+              '${widget.videoId}/action',
+            ),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'action': save ? 'save' : 'unsave',
+              'playlist': playlistName,
+            }),
+          )
+          .timeout(const Duration(seconds: 180));
+
+      final data = jsonDecode(response.body);
+
+      if (!mounted) return false;
+
+      if (response.statusCode != 200) {
+        final detail = data is Map ? data['detail']?.toString() : null;
+
+        throw Exception(detail ?? '操作失败（${response.statusCode}）');
+      }
+
+      // 清单内容变了，用户主页与详情缓存作废
+      AppCache.removeWherePrefix('/api/user/');
+
+      return true;
+    } catch (e) {
+      // 这里不弹提示 —— 由 _applyPlaylistChanges 统一汇总报错，
+      // 否则一次提交会连弹好几条。
+      debugPrint('储存到「$playlistName」失败：$e');
+
+      return false;
+    }
+  }
+
+  /// 下载到本机。
+  /// 选择清晰度后开始下载。
+  ///
+  /// 官网的播放地址是按清晰度分开的（1080p/720p/480p 各一条 mp4），
+  /// 详情接口已经把它们带回来了，所以这里直接列出来给用户挑，
+  /// 不选就用设置里的默认值（再不然用最高画质）。
+  Future<void> _chooseQualityAndDownload() async {
+    final video = _video ?? {};
+
+    final sources = List<Map<String, dynamic>>.from(
+      video['sources'] ?? [],
+    );
+
+    if (sources.isEmpty) {
+      AppToast.error(context, '这个影片没有可直接下载的地址');
+      return;
+    }
+
+    // 只有一种清晰度就没必要问了
+    if (sources.length == 1) {
+      await _startDownload(quality: sources.first['quality']?.toString() ?? '');
+
+      return;
+    }
+
+    final preferred = AppSettings.downloadQuality.value;
+
+    final picked = await showDialog<String>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('选择下载清晰度'),
+        children: [
+          for (final source in sources)
+            SimpleDialogOption(
+              onPressed: () =>
+                  Navigator.of(context).pop(source['quality']?.toString() ?? ''),
+              child: Row(
+                children: [
+                  Icon(
+                    source['quality']?.toString() == preferred
+                        ? Icons.star
+                        : Icons.high_quality_outlined,
+                    size: 20,
+                    color: source['quality']?.toString() == preferred
+                        ? Theme.of(context).colorScheme.primary
+                        : null,
+                  ),
+                  const SizedBox(width: 12),
+                  Text(source['quality']?.toString() ?? '未知'),
+                  const SizedBox(width: 8),
+                  if (source['quality']?.toString() == preferred)
+                    Text(
+                      '默认',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Theme.of(context).colorScheme.primary,
+                      ),
+                    ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+
+    if (picked == null || picked.isEmpty || !mounted) return;
+
+    await _startDownload(quality: picked);
+  }
+
+  Future<void> _startDownload({String quality = ''}) async {
+    final videoId = widget.videoId;
+
+    setState(() {
+      _downloading = true;
+      _downloadPercent = 0;
+    });
+
+    try {
+      final response = await http.post(
+        Uri.parse('${AppConfig.backendBase}/api/download/$videoId'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          if (quality.isNotEmpty) 'quality': quality,
+        }),
+      ).timeout(const Duration(seconds: 180));
+
+      if (response.statusCode != 200) {
+        throw Exception('服务器返回错误: ${response.statusCode}');
+      }
+
+      // 轮询进度
+      while (mounted) {
+        await Future<void>.delayed(const Duration(milliseconds: 800));
+
+        final status = await http.get(
+          Uri.parse('${AppConfig.backendBase}/api/download/$videoId'),
+        ).timeout(const Duration(seconds: 30));
+
+        final job = (jsonDecode(status.body)['job'] ?? {}) as Map;
+
+        final percent = (job['percent'] as num?)?.toInt() ?? 0;
+        final state = job['status']?.toString() ?? '';
+
+        if (mounted) {
+          setState(() => _downloadPercent = percent);
+        }
+
+        if (state == 'done') {
+          if (mounted) {
+            setState(() => _downloading = false);
+
+            AppToast.success(context, '下载完成，已保存到下载文件夹');
+          }
+
+          return;
+        }
+
+        if (state == 'failed' || state == 'cancelled') {
+          if (mounted) {
+            setState(() => _downloading = false);
+
+            AppToast.error(
+              context,
+              state == 'cancelled'
+                  ? '下载已取消'
+                  : '下载失败：${job['error'] ?? '未知原因'}',
+            );
+          }
+
+          return;
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _downloading = false);
+
+        AppToast.error(context, '下载失败：$e');
+      }
+    }
+  }
+
   /// 执行点赞 / 储存。
   ///
-  /// 没登录就先引导登录——不假装成功。
-  Future<void> _doVideoAction(String action) async {
+  /// **乐观更新**：点一下图标立刻点亮，不等待后端，也不显示转圈；
+  /// 真正的同步在后台跑，失败再回滚。
+  Future<void> _doVideoAction(String action, {String playlist = ''}) async {
     if (!AuthController.isLoggedIn) {
       final ok = await showDialog<bool>(
         context: context,
@@ -4231,8 +5517,28 @@ class _VideoDetailPageState
       if (ok != true || !mounted) return;
     }
 
-    setState(() => _acting = true);
+    // 立即点亮图标（乐观）
+    setState(() {
+      switch (action) {
+        case 'like':
+          _liked = true;
+        case 'unlike':
+          _liked = false;
+        case 'save':
+          _saved = true;
+          _savedPlaylist = playlist;
+      }
+    });
 
+    // 后台同步，不阻塞 UI
+    _syncVideoAction(action, playlist: playlist);
+  }
+
+  /// 真正把点赞/储存同步到官网账号（后台运行）。
+  Future<void> _syncVideoAction(
+    String action, {
+    String playlist = '',
+  }) async {
     try {
       final response = await http
           .post(
@@ -4242,7 +5548,10 @@ class _VideoDetailPageState
             headers: const {
               'Content-Type': 'application/json',
             },
-            body: jsonEncode({'action': action}),
+            body: jsonEncode({
+              'action': action,
+              if (playlist.isNotEmpty) 'playlist': playlist,
+            }),
           )
           .timeout(const Duration(seconds: 120));
 
@@ -4260,25 +5569,46 @@ class _VideoDetailPageState
       final message =
           (data is Map ? data['message']?.toString() : null) ?? '完成';
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(message)),
-      );
+      AppToast.success(context, message);
 
-      // 播放清单会变，清掉详情与用户主页缓存后重新加载
+      // 播放清单会变，清掉用户主页缓存
       AppCache.removeWherePrefix('/api/user/');
-      AppCache.remove(_detailCacheKey);
 
-      await _loadVideo();
+      // 用后端返回的最新点赞数就地更新，不再重新加载整页
+      final state = data is Map ? data['state'] : null;
+
+      if (state is Map && mounted) {
+        final ratio = state['like_ratio']?.toString() ?? '';
+        final count = state['like_count']?.toString() ?? '';
+
+        if (ratio.isNotEmpty || count.isNotEmpty) {
+          setState(() {
+            final video = Map<String, dynamic>.from(_video ?? {});
+
+            if (ratio.isNotEmpty) video['like_ratio'] = ratio;
+            if (count.isNotEmpty) video['like_count'] = count;
+
+            _video = video;
+          });
+        }
+      }
     } catch (e) {
       if (!mounted) return;
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$e')),
-      );
-    } finally {
-      if (mounted) {
-        setState(() => _acting = false);
-      }
+      // 同步失败：回滚乐观更新
+      setState(() {
+        switch (action) {
+          case 'like':
+            _liked = false;
+          case 'unlike':
+            _liked = true;
+          case 'save':
+            _saved = false;
+            _savedPlaylist = '';
+        }
+      });
+
+      AppToast.error(context, '$e');
     }
   }
 
@@ -4436,6 +5766,18 @@ class _VideoDetailPageState
                 .floor()
                 .clamp(1, 8);
 
+            // 卡片高度按封面的真实比例算，竖版和横版都能正好装下。
+            //
+            // 官网相关影片的封面基本是竖版（实测 268x394，比例 0.68），
+            // 固定用 0.72 的话竖图会被裁；这里取所有封面比例的中位数，
+            // 混排时也能落在合理值上。
+            final cardAspect = _medianThumbAspect(related);
+
+            // 卡片 = 封面 + 标题两行
+            final thumbHeight = cardWidth / cardAspect;
+            final cardHeight = thumbHeight + 52;
+            final gridAspect = cardWidth / cardHeight;
+
             return GridView.builder(
               shrinkWrap: true,
               physics: const NeverScrollableScrollPhysics(),
@@ -4444,11 +5786,11 @@ class _VideoDetailPageState
                 crossAxisCount: columns,
                 crossAxisSpacing: spacing,
                 mainAxisSpacing: spacing,
-                childAspectRatio: 0.72,
+                childAspectRatio: gridAspect,
               ),
               itemCount: related.length,
               itemBuilder: (context, index) {
-                return _RelatedVideoCard(
+                return RelatedVideoCard(
                   video: related[index],
                   onTap: () {
                     final id = related[index]['video_id']
@@ -4475,14 +5817,122 @@ class _VideoDetailPageState
 
 }
 
+/// 取一组影片封面比例的中位数（拿不到就用 16:9）。
+///
+/// 用中位数而不是平均值：相关影片里偶尔混进个别比例奇怪的封面，
+/// 平均值会被带偏。
+double _medianThumbAspect(List<Map<String, dynamic>> videos) {
+  final ratios = <double>[];
+
+  for (final v in videos) {
+    final r = v['thumb_ratio'];
+
+    if (r is num && r > 0.2 && r < 5) {
+      ratios.add(r.toDouble());
+    }
+  }
+
+  if (ratios.isEmpty) return 16 / 9;
+
+  ratios.sort();
+
+  return ratios[ratios.length ~/ 2];
+}
+
+/// 影片信息小标签（带图标的那种）。
+///
+/// 用户希望信息更好扫读，所以每项都配一个图标：
+/// 播放量用「圆角矩形 + 居中三角」，点赞率用竖大拇指。
+class InfoChip extends StatelessWidget {
+  final InfoChipKind kind;
+  final String text;
+  final String tooltip;
+  final Color? color;
+
+  const InfoChip({
+    super.key,
+    required this.kind,
+    required this.text,
+    this.tooltip = '',
+    this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final tint = color ?? theme.colorScheme.onSurface.withValues(alpha: 0.7);
+
+    final body = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(8),
+        color: theme.colorScheme.onSurface.withValues(alpha: 0.06),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _buildIcon(tint),
+          const SizedBox(width: 6),
+          Text(
+            text,
+            style: TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w600,
+              color: tint,
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (tooltip.isEmpty) return body;
+
+    return Tooltip(message: tooltip, child: body);
+  }
+
+  Widget _buildIcon(Color tint) {
+    // 播放量：一个圆角矩形，中间一个居中的三角（像播放按钮）
+    if (kind == InfoChipKind.play) {
+      return Container(
+        width: 22,
+        height: 15,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(color: tint, width: 1.2),
+        ),
+        child: Center(
+          child: Icon(Icons.play_arrow_rounded, size: 11, color: tint),
+        ),
+      );
+    }
+
+    return Icon(_iconFor(kind), size: 16, color: tint);
+  }
+
+  IconData _iconFor(InfoChipKind kind) => switch (kind) {
+        InfoChipKind.play => Icons.play_arrow_rounded,
+        // 竖着的大拇指
+        InfoChipKind.like => Icons.thumb_up_alt_outlined,
+        InfoChipKind.duration => Icons.schedule,
+        InfoChipKind.size => Icons.sd_storage_outlined,
+        InfoChipKind.views => Icons.visibility_outlined,
+      };
+}
+
+enum InfoChipKind { play, like, duration, size, views }
+
 class _InfoRow
     extends StatelessWidget {
   final String label;
   final String value;
 
+  /// 行首的小图标（让信息更好扫读）
+  final IconData? icon;
+
   const _InfoRow({
     required this.label,
     required this.value,
+    this.icon,
   });
 
   @override
@@ -4494,6 +5944,8 @@ class _InfoRow
       return const SizedBox.shrink();
     }
 
+    final theme = Theme.of(context);
+
     return Padding(
       padding:
           const EdgeInsets.only(
@@ -4503,8 +5955,16 @@ class _InfoRow
         crossAxisAlignment:
             CrossAxisAlignment.start,
         children: [
+          if (icon != null) ...[
+            Icon(
+              icon,
+              size: 16,
+              color: theme.colorScheme.primary,
+            ),
+            const SizedBox(width: 6),
+          ],
           SizedBox(
-            width: 90,
+            width: icon != null ? 84 : 90,
             child: Text(
               label,
               style:
@@ -4557,6 +6017,9 @@ class _FullscreenPlayerPageState
   late String _currentQuality;
   late double _volume;
 
+  /// 音量提示（放进本页的 Stack，居中于画面）
+  final VolumeToastController _volumeToast = VolumeToastController();
+
   bool _showControls = true;
   bool _showVolumeSlider = false;
   bool _switchingQuality = false;
@@ -4606,6 +6069,7 @@ class _FullscreenPlayerPageState
     _controlsTimer?.cancel();
     _volumeHideTimer?.cancel();
     _controller.removeListener(_onControllerTick);
+    _volumeToast.dispose();
     super.dispose();
   }
 
@@ -4834,6 +6298,7 @@ class _FullscreenPlayerPageState
                             setState(() {
                               _volume = _volume == 0 ? 1 : 0;
                               _controller.setVolume(_volume);
+                              AppSettings.setLastVolume(_volume);
                               widget.onVolumeChanged(_volume);
                             });
                           },
@@ -4873,6 +6338,8 @@ class _FullscreenPlayerPageState
                                           _controller.setVolume(value);
                                           widget.onVolumeChanged(value);
                                         });
+
+                                        AppSettings.setLastVolume(value);
                                       },
                                     ),
                                   ),
@@ -4939,7 +6406,19 @@ class _FullscreenPlayerPageState
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    return PlayerShortcuts(
+      // 全屏页：ESC 退出全屏（这里就是关掉本页）
+      fullscreen: true,
+      onExitFullscreen: () => Navigator.of(context).maybePop(),
+      player: () => _controller,
+      volume: _volume,
+      onVolumeChanged: (v) {
+        setState(() => _volume = v);
+        AppSettings.setLastVolume(v);
+        _volumeToast.show(v);
+      },
+      onActivity: _onMouseMove,
+      child: Scaffold(
       backgroundColor: Colors.black,
       body: MouseRegion(
         onHover: (_) => _onMouseMove(),
@@ -5000,8 +6479,25 @@ class _FullscreenPlayerPageState
                 ),
               ),
             ),
+
+            // 调音量时在画面正中显示
+            ListenableBuilder(
+              listenable: _volumeToast,
+              builder: (context, _) {
+                if (!_volumeToast.visible) return const SizedBox.shrink();
+
+                return Positioned.fill(
+                  child: IgnorePointer(
+                    child: Center(
+                      child: VolumeToast(volume: _volumeToast.volume!),
+                    ),
+                  ),
+                );
+              },
+            ),
           ],
         ),
+      ),
       ),
     );
   }
@@ -5120,34 +6616,34 @@ class _AccountTile extends StatelessWidget {
 // 详情页操作条 / 相关影片
 // ==========================================================
 
-/// 详情页操作条上的一个只读按钮（点赞 / 储存 / 下载）。
+/// 详情页操作条上的一个按钮（点赞 / 储存 / 下载）。
 ///
-/// 官网的点赞和储存需要登录账号才能生效，所以这里做成展示型按钮，
-/// 不假装能点，但把真实的点赞比例和数量显示出来。
+/// 点赞和储存会真正作用到官网账号。
+///
+/// 状态**只靠图标形状**表达（空心 ↔ 实心），刻意不做变色/高亮 ——
+/// 之前点赞和储存会整块变绿，看起来像和背景撞色，观感也乱。
+/// 图标用的中性 `onSurface` 色在深色和浅色主题下都有足够对比度。
 class _ActionChip extends StatelessWidget {
   final IconData icon;
   final String label;
   final String trailing;
   final String tooltip;
-  final Color? color;
   final VoidCallback? onTap;
-  final bool busy;
 
   const _ActionChip({
     required this.icon,
     required this.label,
     this.trailing = '',
     this.tooltip = '',
-    this.color,
     this.onTap,
-    this.busy = false,
   });
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
-    final tint = color ?? theme.colorScheme.onSurface.withValues(alpha: 0.7);
+
+    final tint = theme.colorScheme.onSurface.withValues(alpha: 0.7);
 
     Widget chip = Container(
       height: 40,
@@ -5164,17 +6660,8 @@ class _ActionChip extends StatelessWidget {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (busy)
-            SizedBox(
-              width: 18,
-              height: 18,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                color: tint,
-              ),
-            )
-          else
-            Icon(icon, size: 18, color: tint),
+          // 不显示转圈：无论是否在同步，图标都保持可见
+          Icon(icon, size: 18, color: tint),
           const SizedBox(width: 8),
           Text(
             label,
@@ -5214,20 +6701,21 @@ class _ActionChip extends StatelessWidget {
 }
 
 /// 相关影片卡片：封面 + 标题。
-class _RelatedVideoCard extends StatefulWidget {
+class RelatedVideoCard extends StatefulWidget {
   final Map<String, dynamic> video;
   final VoidCallback onTap;
 
-  const _RelatedVideoCard({
+  const RelatedVideoCard({
+    super.key,
     required this.video,
     required this.onTap,
   });
 
   @override
-  State<_RelatedVideoCard> createState() => _RelatedVideoCardState();
+  State<RelatedVideoCard> createState() => _RelatedVideoCardState();
 }
 
-class _RelatedVideoCardState extends State<_RelatedVideoCard> {
+class _RelatedVideoCardState extends State<RelatedVideoCard> {
   bool _hovering = false;
 
   @override
@@ -5237,6 +6725,22 @@ class _RelatedVideoCardState extends State<_RelatedVideoCard> {
 
     final title = widget.video['title']?.toString() ?? '';
     final thumbnail = widget.video['thumbnail']?.toString() ?? '';
+
+    // 按封面真实比例渲染。
+    //
+    // 相关影片区混着两种封面：
+    //   - 竖版（官网实测 268x394，比例 0.68）
+    //   - 横版（16:9）
+    // 以前一律按 16:9 画，竖图会被 BoxFit.cover 裁掉一大半。
+    // 后端已经在浏览器里量过每张图的真实尺寸，这里直接用；
+    // 量不到就退回 16:9。
+    final rawRatio = widget.video['thumb_ratio'];
+
+    var aspect = 16 / 9;
+
+    if (rawRatio is num && rawRatio > 0.2 && rawRatio < 5) {
+      aspect = rawRatio.toDouble();
+    }
 
     return MouseRegion(
       cursor: SystemMouseCursors.click,
@@ -5255,8 +6759,11 @@ class _RelatedVideoCardState extends State<_RelatedVideoCard> {
           padding: const EdgeInsets.all(6),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
             children: [
-              Expanded(
+              // 竖版封面就别硬塞进横版框里
+              AspectRatio(
+                aspectRatio: aspect,
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(8),
                   child: thumbnail.isEmpty
@@ -5273,6 +6780,8 @@ class _RelatedVideoCardState extends State<_RelatedVideoCard> {
                         )
                       : Image.network(
                           thumbnail,
+                          // 竖版封面用 contain 会留黑边，用 cover 又裁；
+                          // 框本身已经按真实比例，所以 cover 不会裁掉内容
                           fit: BoxFit.cover,
                           width: double.infinity,
                           errorBuilder: (_, _, _) => Container(

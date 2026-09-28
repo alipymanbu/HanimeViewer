@@ -7,6 +7,7 @@ import 'controllers/app_cache.dart';
 import 'controllers/app_config.dart';
 import 'main.dart';
 import 'widgets/windows11_loading.dart';
+import 'widgets/pager_bar.dart';
 
 /// 新番预告。
 ///
@@ -196,62 +197,76 @@ class _NewReleasePageState extends State<NewReleasePage> {
       );
     }
 
+    // 这里**没有**页内标题栏：侧边栏已经写着"新番预告"了，
+    // 再加一行"图标 + 新番预告 + 刷新"纯属占地方（用户要求去掉）。
+    // 刷新用下拉刷新，见 _buildGrid 外面的 RefreshIndicator。
     return Column(
       children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
-          child: Row(
-            children: [
-              Icon(
-                Icons.new_releases,
-                size: 20,
-                color: theme.colorScheme.primary,
-              ),
-              const SizedBox(width: 8),
-              const Text(
-                '新番预告',
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              const Spacer(),
-              IconButton(
-                tooltip: '刷新',
-                onPressed: () => _load(page: _page),
-                icon: const Icon(Icons.refresh),
-              ),
-            ],
-          ),
-        ),
         Expanded(child: _buildGrid()),
         if (_totalPages > 1) _buildPager(theme),
       ],
     );
   }
 
-  Widget _buildGrid() {
-    return GridView.builder(
-      padding: const EdgeInsets.fromLTRB(20, 4, 20, 20),
-      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-        maxCrossAxisExtent: 240,
-        crossAxisSpacing: 14,
-        mainAxisSpacing: 14,
-        // 缩略图 16:9 + 标题两行 + 一条信息
-        childAspectRatio: 0.95,
-      ),
-      itemCount: _videos.length,
-      itemBuilder: (context, index) {
-        final video = _videos[index];
+  /// 这一页封面的统一比例（新番预告是竖版 0.68）。
+  ///
+  /// 用中位数而不是取第一张：万一某张图加载失败就没有比例信息，
+  /// 取第一张会不稳。
+  double get _coverAspect {
+    final ratios = <double>[];
 
-        return VideoGridCard(
-          title: video['title']?.toString() ?? '',
-          thumbnail: video['thumbnail']?.toString() ?? '',
-          duration: video['duration']?.toString() ?? '',
-          views: video['views']?.toString() ?? '',
-          onTap: () => _openVideo(video['url']?.toString() ?? ''),
-        );
-      },
+    for (final v in _videos) {
+      final r = v['thumb_ratio'];
+
+      if (r is num && r > 0.2 && r < 5) ratios.add(r.toDouble());
+    }
+
+    if (ratios.isEmpty) return 16 / 9;
+
+    ratios.sort();
+
+    return ratios[ratios.length ~/ 2];
+  }
+
+  Widget _buildGrid() {
+    // 卡片宽度用 maxCrossAxisExtent 决定，高度按封面比例算出来。
+    // 竖版封面要留出足够高度，否则标题会被挤出屏幕。
+    const maxCardWidth = 200.0;
+    final coverHeight = maxCardWidth / _coverAspect;
+
+    // 封面 + 标题两行 + 一行信息
+    final cardHeight = coverHeight + 56;
+
+    // 右上角那个刷新按钮已经去掉了，改成下拉刷新 ——
+    // 不然这一页就没法刷新了（它不会像列表那样自己重载）。
+    return RefreshIndicator(
+      onRefresh: () => _load(page: _page),
+      child: GridView.builder(
+        padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+        gridDelegate: SliverGridDelegateWithMaxCrossAxisExtent(
+          maxCrossAxisExtent: maxCardWidth,
+          crossAxisSpacing: 14,
+          mainAxisSpacing: 14,
+          mainAxisExtent: cardHeight,
+        ),
+        itemCount: _videos.length,
+        itemBuilder: (context, index) {
+          final video = _videos[index];
+
+          final rawRatio = video['thumb_ratio'];
+
+          return VideoGridCard(
+            title: video['title']?.toString() ?? '',
+            thumbnail: video['thumbnail']?.toString() ?? '',
+            duration: video['duration']?.toString() ?? '',
+            views: video['views']?.toString() ?? '',
+            aspectRatio: rawRatio is num && rawRatio > 0.2 && rawRatio < 5
+                ? rawRatio.toDouble()
+                : null,
+            onTap: () => _openVideo(video['url']?.toString() ?? ''),
+          );
+        },
+      ),
     );
   }
 
@@ -259,39 +274,11 @@ class _NewReleasePageState extends State<NewReleasePage> {
     return Column(
       children: [
         const Divider(height: 1),
-        Padding(
-          padding: const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 8,
-          ),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              IconButton(
-                tooltip: '上一页',
-                onPressed: (_page > 1 && !_loading)
-                    ? () => _load(page: _page - 1)
-                    : null,
-                icon: const Icon(Icons.chevron_left),
-              ),
-              const SizedBox(width: 8),
-              Text(
-                '第 $_page / $_totalPages 页',
-                style: TextStyle(
-                  fontSize: 13,
-                  color: theme.colorScheme.onSurface.withValues(alpha: 0.7),
-                ),
-              ),
-              const SizedBox(width: 8),
-              IconButton(
-                tooltip: '下一页',
-                onPressed: (_page < _totalPages && !_loading)
-                    ? () => _load(page: _page + 1)
-                    : null,
-                icon: const Icon(Icons.chevron_right),
-              ),
-            ],
-          ),
+        PagerBar(
+          page: _page,
+          totalPages: _totalPages,
+          loading: _loading,
+          onGoToPage: (target) => _load(page: target),
         ),
       ],
     );
@@ -308,12 +295,19 @@ class VideoGridCard extends StatefulWidget {
   final String views;
   final VoidCallback onTap;
 
+  /// 封面真实宽高比。
+  ///
+  /// 「新番預告」的封面是竖版（实测 268x394，约 0.68），
+  /// 硬按 16:9 画会把竖图裁掉一大半。为 null 时退回 16:9。
+  final double? aspectRatio;
+
   const VideoGridCard({
     super.key,
     required this.title,
     required this.thumbnail,
     this.duration = '',
     this.views = '',
+    this.aspectRatio,
     required this.onTap,
   });
 
@@ -353,11 +347,11 @@ class _VideoGridCardState extends State<VideoGridCard> {
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
-              // 缩略图统一 16:9（和 APP 首页、观看记录一致），
-              // 用 AspectRatio 而不是 Expanded：
-              // Expanded 会让缩略图随标题行数变化高度，同一页里大小不一。
+              // 按封面真实比例画（竖版就画竖版）。
+              // 用 AspectRatio 而不是 Expanded：Expanded 会让缩略图
+              // 随标题行数变化高度，同一页里大小不一。
               AspectRatio(
-                aspectRatio: 16 / 9,
+                aspectRatio: widget.aspectRatio ?? 16 / 9,
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(8),
                   child: Stack(

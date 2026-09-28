@@ -16,6 +16,12 @@ class AppCache {
   /// 首页栏目（首页内容变化不频繁）
   static const Duration homeTtl = Duration(minutes: 5);
 
+  /// 首页栏目的缓存 key。
+  ///
+  /// 设置页里排栏目顺序时也要读它拿栏目名，所以放在这里当公共常量，
+  /// 不要在两处各写一遍字符串。
+  static const String homeSectionsKey = 'home_sections';
+
   /// 搜索/筛选结果
   static const Duration searchTtl = Duration(minutes: 3);
 
